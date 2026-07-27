@@ -20,11 +20,15 @@ SESSION_CACHE = HOOK_DIR / ".recall_session_cache"
 MIN_SCORE  = 0.35
 N_RESULTS  = 4
 
-# Topics never surfaced via this automatic path — per personal_context.md's
-# "What Not to Volunteer" section, financial details shouldn't be surfaced
-# proactively. Still fully queryable via a direct recall() call when the
-# user actually raises the topic; this only blocks the unprompted hook path.
-EXCLUDE_TOPICS = {"financial"}
+# Topics never surfaced via this automatic path (still fully queryable via a
+# direct recall() call when the user actually raises the topic themselves —
+# this only blocks the unprompted hook path). Configure your own sensitive
+# topics in local_config.py (gitignored, not this file) rather than here, so
+# the published script never carries anyone's real topic names.
+try:
+    from local_config import EXCLUDE_TOPICS
+except ImportError:
+    EXCLUDE_TOPICS = set()
 
 
 def log_error(exc):

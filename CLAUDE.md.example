@@ -32,7 +32,11 @@ jot('...', topic_hint='<cwd-basename-or-project-name>')
   - If the user confirms a `recall_cold()` hit is really the thing, call **`revive_from_cold(doc_id)`** — brings it back into ordinary recall. If they deny it, do nothing.
   - **`purge(doc_id)`** exists for true permanent deletion, but this is a rare, deliberate action — don't reach for it as routine cleanup, and don't call it without the user explicitly asking to permanently remove something.
 
-**Sensitive topics**: `recall_hook.py`'s automatic `UserPromptSubmit` path supports an `EXCLUDE_TOPICS` constant — topics that are fine to discuss but shouldn't surface unprompted (e.g. a `financial` or `health` topic folder). This is a full exclusion from the *automatic* hook only; it's still fully queryable via a direct `recall()` call when the user actually raises the topic themselves. Configure `EXCLUDE_TOPICS` in `recall_hook.py` for whatever topics are sensitive in your own corpus.
+**Sensitive topics**: `recall_hook.py`'s automatic `UserPromptSubmit` path supports an `EXCLUDE_TOPICS` set — topics that are fine to discuss but shouldn't surface unprompted (e.g. a `financial` or `health` topic folder). This is a full exclusion from the *automatic* hook only; it's still fully queryable via a direct `recall()` call when the user actually raises the topic themselves. Configure it in a local `local_config.py` next to `recall_hook.py` (gitignored by default — create it yourself, it's not part of the repo) rather than editing `recall_hook.py` directly, e.g.:
+```python
+# local_config.py
+EXCLUDE_TOPICS = {"financial", "health"}
+```
 
 **Backlinks (`## Related` sections, cross-topic linking) only apply to the curated `ingest()` tier** — they're written by a `PostToolUse` hook on `Write`, which `jot()` never triggers (no file is written). Two `jot()` fragments about the same thing are connected only by both being semantically retrievable via `recall()`, not by any explicit link between them.
 

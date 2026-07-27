@@ -10,6 +10,7 @@ session_summaries/*
 # (real corpus scope, real absolute paths, real excluded topics). The public-
 # facing docs are README.md and CLAUDE.md.example instead.
 CLAUDE.md
+local_config.py
 .chromadb/
 .auto_capture_state.json
 .recall_session_cache
