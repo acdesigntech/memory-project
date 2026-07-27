@@ -1,0 +1,43 @@
+# Global instructions template — memory-project
+
+Copy this into your own `~/.claude/CLAUDE.md` (or merge it into an existing one) after cloning and setting up this repo. Replace `/path/to/memory-project` below with wherever you actually cloned it. These instructions apply **regardless of which directory a Claude Code session is launched from** — that's the whole point.
+
+## Long-term memory: use this system, not Claude Code's built-in per-project memory
+
+This machine has a custom long-term memory system at `/path/to/memory-project` (ChromaDB-backed, embeddings via `memory_store.py`). Full rationale in that repo's own `README.md`.
+
+Prefer this system over Claude Code's built-in per-project memory (`~/.claude/projects/<encoded-cwd>/memory/*.md`) — that built-in memory is scoped to one literal directory path and has no decay, reinforcement, or semantic recall. Don't dual-track facts in both places; pick this system as the single source of truth.
+
+**Public API** (call via this project's venv interpreter, from any cwd):
+```
+/path/to/memory-project/.venv/bin/python -c "
+from memory_store import jot, recall
+jot('...', topic_hint='<cwd-basename-or-project-name>')
+"
+```
+(`memory_store.py` resolves paths relative to its own file location, so this works unmodified from any project directory.)
+
+- **`jot(text, session_id='', topic_hint=None)`** — cheap, unfiled, mid-conversation capture. **Call this proactively, without being asked and without asking permission**, whenever something worth remembering across sessions comes up: a stated preference, a correction, a decision reached in conversation, something surprising or non-obvious. Bar is deliberately low — err toward jotting; the decay/reinforcement pipeline sorts out what matters over time. `topic_hint` defaults to cwd's basename; pass the current project's name explicitly when useful.
+- **`recall(query, n_results=5, exclude_topic=None, topic_hint=None)`** — semantic retrieval. A `UserPromptSubmit` hook already runs this automatically, but **only once per session, on the first prompt** — it will not fire again for anything raised later in the same conversation. Mid-conversation, `recall()` is on the assistant to call explicitly, not something a hook covers:
+  - **Trigger**: the user references something specific (a name, a decision, a prior project detail, "remember when...") that isn't explained by the current conversation. This includes things there's only partial/thin context on, not only total unknowns.
+  - This is a judgment call made live, not an automatic trigger — say when you're doing it (e.g. "let me check what's on record about X") rather than querying silently or guessing instead of checking.
+  - Don't fire it reflexively on every message — it has real cost (each hit reinforces that memory's decay clock, and the embedding model adds latency). Reserve it for a genuine "I don't actually know this, or don't know it well enough" moment.
+- **`ingest(path)`** — full curated session-summary file (topic-foldered, backlinked). Reserve for something big enough to be worth filing and reading later as a standalone doc — a finished feature, a real investigation, a milestone. `jot()` is for everything smaller than that.
+- **`recall_associative(query, n_results=5, n_activated=3, exclude_topic=None, topic_hint=None)`** + **`confirm_activation(doc_id)`** — the "rings a bell" cued-recall pair. Use this **instead of** plain `recall()` whenever the trigger above fires but you're not confident a strong match exists. Returns `{"confident": [...], "activated": [...]}`:
+  - `confident` hits (score >= 0.35): reinforced automatically, state as fact, same as plain `recall()`.
+  - `activated` hits (0.15-0.35): weak, unreinforced associative matches. **Apply judgment before mentioning any of them** — don't dump every weak match, only surface ones that plausibly seem relevant, and always with hedging language ("this might be related...", "does this ring a bell...", "not sure if this is the same X, but..."). This is the same judgment-call framing as the plain-`recall()` trigger above, just applied one tier further out.
+  - The user's **next response is the reinforcement signal**: if they affirm or correct-but-confirm the surfaced memory, call `confirm_activation(doc_id)` on it — this applies a bigger stability boost than an ordinary recall (2.5x vs 1.5x), deliberately, because a memory retrieved under real uncertainty and then confirmed correct should reinforce more than one retrieved easily. **If they deny or correct it away, do nothing** — no function call, no penalty, just move on.
+- **`prune()` archives, it does not delete** — modeling human "I haven't thought about that in 40 years!" memory rather than true erasure. Archived memories are invisible to `recall()`/`recall_associative()` entirely, but not gone.
+  - **`recall_cold(query, n_results=3)`** — searches only cold-storage memories, with a much stricter bar (0.6 raw similarity) than ordinary recall. Use it when something feels like it *should* be on record but isn't surfacing normally — a specific, current detail in conversation is the trigger. Hedge even harder than with `recall_associative()`'s activated tier — this is a genuine long-shot by design.
+  - If the user confirms a `recall_cold()` hit is really the thing, call **`revive_from_cold(doc_id)`** — brings it back into ordinary recall. If they deny it, do nothing.
+  - **`purge(doc_id)`** exists for true permanent deletion, but this is a rare, deliberate action — don't reach for it as routine cleanup, and don't call it without the user explicitly asking to permanently remove something.
+
+**Sensitive topics**: `recall_hook.py`'s automatic `UserPromptSubmit` path supports an `EXCLUDE_TOPICS` constant — topics that are fine to discuss but shouldn't surface unprompted (e.g. a `financial` or `health` topic folder). This is a full exclusion from the *automatic* hook only; it's still fully queryable via a direct `recall()` call when the user actually raises the topic themselves. Configure `EXCLUDE_TOPICS` in `recall_hook.py` for whatever topics are sensitive in your own corpus.
+
+**Backlinks (`## Related` sections, cross-topic linking) only apply to the curated `ingest()` tier** — they're written by a `PostToolUse` hook on `Write`, which `jot()` never triggers (no file is written). Two `jot()` fragments about the same thing are connected only by both being semantically retrievable via `recall()`, not by any explicit link between them.
+
+**When starting work in a new or unfamiliar project directory**: don't assume this system is irrelevant just because you're elsewhere. `recall()` a couple of likely queries early if the project seems related to prior work, and `jot()` as things come up during the session same as anywhere else.
+
+## Project directory convention (optional — adapt to your own setup)
+
+If you keep multiple projects, consider a single standard parent directory for them (e.g. `~/projects/`) rather than scattering them loose — makes this system's `topic_hint` conventions and your own navigation more consistent. Not required by the tool itself, just a convention worth picking deliberately.

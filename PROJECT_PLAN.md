@@ -1,0 +1,74 @@
+# Project Plan — memory-project
+
+## Goal
+
+EA-style associative memory for Claude Code: context on past work should be available regardless of which project or directory a session launches from, the way an executive assistant carries context across an executive's whole portfolio rather than one meeting at a time.
+
+## The memory chain
+
+The system models memory as a chain of phases, deliberately mirroring how human associative/episodic memory works rather than building a flat search index. Status of each link:
+
+1. **Encoding** — `ingest()` in `memory_store.py`. DONE.
+2. **Filing / classification** — `classify.py` (TF-IDF centroid prototype, 87.9% leave-one-out accuracy). DONE.
+3. **Association / backlinking** — `incremental_backlink.py` (encoding-time) + `apply_backlinks.py` (periodic consolidation sweep). DONE.
+4. **Decay** — `strength = exp(-t/stability)`, computed at query time in `recall()`, never stored. DONE.
+5. **Reinforcement** — every `recall()` hit grows `stability` (x1.5, capped at 10x base). DONE.
+6. **Retrieval, global** — `recall_hook.py` wired globally via `~/.claude/settings.json`; works from any launch directory. DONE (2026-07-18).
+7. **Capture, global** — new memories used to only get created when someone manually wrote a file under `session_summaries/` or called `jot()` live. DONE (2026-07-25) — see below.
+8. **Consolidation** — promote `episodic` memories to `semantic` (90-day base stability vs. 7-day) based on repeated reinforcement, so genuinely important/recurring context becomes harder to forget over time. DONE (2026-07-18).
+9. **Cued / associative recall** — surface memories that don't meet the confident retrieval bar on their own but are weakly related to what's being discussed, the "rings a bell" experience, with human-in-the-loop confirmation driving reinforcement. DONE (2026-07-25) — see below. (Design detail for this had originally been written up 2026-07-17, but that file was lost in the 2026-07-20 stale-corpus pruning before it could be built from; rebuilt from the user's own recollection of the design instead.)
+10. **Cold storage (non-destructive forgetting)** — `prune()` no longer deletes; it archives, modeling human "I haven't thought about that in 40 years!" memory rather than true erasure. DONE (2026-07-25) — see below.
+
+## Consolidation (DONE 2026-07-18)
+
+Resolved all four open design questions and shipped:
+
+- **Trigger**: promotion fires exactly when a `recall()` grows a memory's stability up to the episodic cap (`EPISODIC_BASE_STABILITY * STABILITY_CAP_FACTOR` = 70 days) — the point where further episodic reinforcement literally cannot help it anymore, so consolidation is the natural next step rather than an arbitrary new threshold.
+- **Effect on stability**: resets to `SEMANTIC_BASE_STABILITY` (90 days) on promotion. Since the trigger is the 70-day episodic cap, this is a net increase, not a discard of earned stability.
+- **`consolidation_level`**: previously dead (always `0`, never read); now increments to `1` on promotion, giving the field real meaning.
+- **Where it runs**: inline inside `recall()`, in `_maybe_consolidate()`, at the same point `_grow_stability()` already runs — not a separate `consolidate()` sweep requiring a manual call site (that would've just recreated the same "nobody ever calls it" gap `prune()` already has).
+- **Reversibility**: one-way, no demotion. A semantic memory that stops being useful still decays via `strength` and can still eventually be pruned, just on the slower 90-day-based clock.
+- **Verified two ways**: unit-tested `_maybe_consolidate()` directly (below cap / at cap / already-semantic cases), and end-to-end through the real `recall()` path on a live corpus memory (temporarily pushed to the cap, promoted correctly, original state restored after).
+
+## Cued / associative recall (DONE 2026-07-25)
+
+Two new functions in `memory_store.py`, built on top of the existing `recall()` scoring (refactored into a shared `_score_hits()` helper so both paths stay consistent):
+
+- **`recall_associative(query, n_results=5, n_activated=3, ...)`** — splits the same scored candidate pool into two tiers instead of one cutoff:
+  - `confident` (score >= `CONFIDENT_THRESHOLD` = 0.35, matching `recall_hook.py`'s existing bar): reinforced immediately at the normal rate (`STABILITY_GROWTH` = 1.5x), safe to state as fact — identical behavior to plain `recall()`.
+  - `activated` (`ACTIVATION_FLOOR` = 0.15 <= score < 0.35): weak, uncertain associative matches. **Deliberately NOT auto-reinforced** — surfacing a memory this way shouldn't count as a real recall until a human confirms it actually was relevant.
+- **`confirm_activation(doc_id)`** — call after the user affirms an `activated`-tier hit. Applies `ACTIVATION_STABILITY_BOOST` (2.5x) — bigger than an ordinary recall's 1.5x — because a confirmed memory that was retrieved under real uncertainty should reinforce more than one retrieved easily (the "desirable difficulty" / testing-effect finding from human memory research the user recalled from an earlier, now-lost design discussion). **No corresponding "punish" path on denial** — if the user denies or corrects the guess, the caller does nothing; an unconfirmed weak activation neither strengthens nor weakens on its own.
+
+**Where the judgment call lives**: `recall_associative()` itself doesn't decide what's "relevant enough to mention" — it just returns the two tiers. Claude is expected to look at the `activated` list, apply judgment about which ones actually seem related to the current conversation, and surface only those with hedging language ("this might be related...", "does this ring a bell...") — not dump every weak match. This is a global instruction (`~/.claude/CLAUDE.md`), not enforced in code, the same way `jot()`'s "call proactively" instruction isn't code-enforced either.
+
+**Not implemented (deliberately, per the user's own spec)**: no automatic suppression/demotion of a denied `activated` hit. The original design was explicitly "just do nothing with it if denied or corrected," not an active penalty — asymmetric by design (confirmation reinforces harder than normal; denial does nothing rather than actively decaying it faster).
+
+## Cold storage / non-destructive forgetting (DONE 2026-07-25)
+
+The user's objection to the old design: once `prune()` deleted something, it was truly gone — real human forgetting doesn't work that way. What actually happens is closer to cold storage: the memory isn't accessible through ordinary thinking anymore, but a sufficiently specific cue can still resurface it (the "haven't thought about that in 40 years!" experience), *triggered by something current* — whatever's live in the conversation right now — not by one memory cross-activating another.
+
+- **`prune()` redefined**: instead of `col.delete()`, it now sets `archived=True` (+ `archived_at` timestamp) on entries below `DELETION_FLOOR`. The embedding and content stay in `.chromadb` — nothing is erased. Idempotent (skips already-archived entries).
+- **`archived` entries are invisible to ordinary retrieval**: `_score_hits()` (the shared logic under both `recall()` and `recall_associative()`) filters them out unconditionally, at the same point it filters `exclude_topic`. They don't show up even in `recall_associative()`'s weak `activated` tier — cold storage is a harder boundary than "just weakly matched."
+- **`recall_cold(query, n_results=3)`** — the only way back in. Searches *exclusively* archived entries, ranked by raw cosine similarity, not the usual `similarity * strength` score — an archived memory's `strength` is frozen at whatever it decayed to and is not a meaningful ranking signal (it doesn't recover on its own, `recall()` never touches it again once archived). Filtered against `COLD_REVIVAL_THRESHOLD` (0.6) — deliberately much stricter than the ordinary confident bar (0.35), since resurfacing something long-dormant should take a genuinely specific match, not a loose association.
+- **`revive_from_cold(doc_id)`** — call once the user confirms a `recall_cold()` hit is genuinely the thing they meant. Un-archives it and resets `stability` to its own `memory_type`'s base (episodic or semantic, whichever it was when it went cold — revival doesn't demote a previously-consolidated memory back to episodic). Ordinary `recall()` finds it again immediately afterward.
+- **`purge(doc_id)`** — added as the *actual* hard-delete escape hatch, for the genuinely rare case of something that should never have been recorded at all (e.g. accidentally-jotted sensitive content). Not routine cleanup — `prune()` is routine cleanup now, `purge()` explicitly is not.
+- **Verified end-to-end** with a disposable test memory (jotted, artificially aged, then `purge()`d clean afterward so it didn't pollute the real corpus): confirmed archived-not-deleted, invisible to both `recall()` and `recall_associative()`, findable via `recall_cold()` only with a genuinely matching query (0.84 similarity) and correctly *not* findable with an unrelated one, successfully revived back into ordinary recall, and `purge()` still does true deletion when that's actually wanted. Also confirmed running `prune()` for real only archived the disposable test entry — nothing in the live corpus was old enough to be swept up.
+
+## Capture, global (DONE 2026-07-25)
+
+Implemented as new files alongside `memory_store.py`: `capture_state.py`, `auto_capture.py`, and `hooks/session_end_capture.py` / `hooks/session_start_backstop.py`, wired into `~/.claude/settings.json` as `SessionEnd` / `SessionStart` hooks.
+
+- **`capture_state.py`** — flat JSON file (`.auto_capture_state.json`) tracking, per `session_id`: `last_finalized_line` (how far that session's transcript has already been processed) and `cwds_seen`. Matches the project's existing convention of small flat state files rather than a database.
+- **`auto_capture.py` / `capture_session(session_id, transcript_path)`** — reads the RAW transcript file directly (never the live, possibly-already-compacted context of whatever session triggered it), from `last_finalized_line` to current end-of-file. Chunks at `compact_boundary` marker entries where present (a real, natural boundary the platform itself writes into the transcript on every compaction — confirmed empirically, includes `compactMetadata` with `preTokens`/`postTokens`/`cumulativeDroppedTokens`), falling back to a character budget otherwise. Each chunk goes through one `claude -p` subprocess call with an extraction prompt asking for the SAME low-bar judgment a human jotter would use, returned as a JSON array of `{text, topic_hint}`. Every extracted fact goes in via `jot()` only — never `ingest()` — per explicit instruction ("make it perform like jot()"): fully autonomous, no human review gate, same fragment tier and decay/reinforcement pipeline as anything jotted live.
+- **`hooks/session_end_capture.py`** — thin `SessionEnd` wrapper. Best-effort: confirmed via documentation that `SessionEnd` does not reliably fire on abnormal termination (crash, force-quit, terminal closed), so this is a bonus finalize pass when it does fire, not something relied on as guaranteed.
+- **`hooks/session_start_backstop.py`** — the actual safety net. On `source == "startup"` only (a genuinely fresh session, not `resume`/`clear`/`compact`/`fork` of an already-running one), scans every `~/.claude/projects/*/*.jsonl` transcript — not folder-scoped to the current project, since a single session's transcript can span multiple `cwd` values over its life and lives wherever its first entry resolved to (confirmed empirically against a real 3-day, 94MB session transcript that touched 5 different working directories) — for sessions with unprocessed content. Liveness is checked via `lsof` (does any process currently have the file open), not a time-based mtime guess: an earlier version used "not modified in the last N minutes," which is exactly wrong for an abrupt crash immediately followed by a new session — that leaves a very-recent mtime with no live writer at all, which a time-based guard would incorrectly skip. Capped at `MAX_ORPHANS_PER_SWEEP` (3) per invocation so a large backlog clears gradually rather than all at once.
+- **`PreCompact` hook considered and explicitly dropped.** Original design used it for incremental staging-file writes; abandoned once it was confirmed the raw transcript never loses history across compaction (only ever appends a `compact_boundary` marker, never deletes prior lines) — there was nothing left for a staging copy to protect against. A real-extraction-at-every-compaction mode was also considered, for lower latency on a very long single session that never triggers `SessionEnd` or a new `SessionStart` — but measured directly: a single trivial `claude -p` subprocess call costs ~$0.09 and ~36,000 tokens in pure system-prompt/tool-loading overhead alone (before any real content), on the same shared, capped Pro-tier quota interactive work also draws from. Not worth it for the latency win alone; decided against.
+- **Verified**: state tracking (read/write/idempotent), extraction pipeline (idempotent on no new content, correctly incremental across a `compact_boundary`, correctly skips `tool_use`/`tool_result`/`thinking` blocks), both hook scripts via simulated stdin, backstop safety logic in an isolated fake environment (captures a genuinely orphaned session, skips one still held open by a live process, excludes the just-starting session, no-ops on any `source` other than `startup`), and a full end-to-end run against a real 300-line slice of an actual multi-day session — produced 5 specific, correctly-attributed, genuinely good facts. All test/disposable data purged afterward so nothing polluted the real corpus.
+
+## Status
+
+The core chain (items 1-10) is now fully built. No open "current focus" item remains in the chain itself — next work comes from either promoting something out of the parking lot, or a new need surfacing.
+
+## Parking lot
+
+Deferred items — lower priority or currently blocked, not on the critical path of the chain above: auto-discovery of `CORPUS_DIR`, correction encoding, `prune()` never being called automatically. (Cued/associative recall and global auto-capture have both been promoted out of this list — see above; both done.) The original parking-lot detail file (`session_summaries/claude/2026-07-17_associative-memory.md`) was lost in the 2026-07-20 stale-corpus pruning — if any of these remaining items also had detail only recorded there, that detail is gone and would need to be re-derived rather than looked up.

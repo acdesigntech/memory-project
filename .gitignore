@@ -1,0 +1,28 @@
+# Personal data — never publish. Allowlist approach deliberately, not a named
+# blocklist: naming excluded topic folders here would itself leak what they're
+# about to anyone reading this file in the public repo. Everything under
+# session_summaries/ is ignored by default; only the project's own dev-history
+# folder is explicitly let back in.
+session_summaries/*
+!session_summaries/memory-project/
+
+# CLAUDE.md itself is also excluded: it's this machine's real operational doc
+# (real corpus scope, real absolute paths, real excluded topics). The public-
+# facing docs are README.md and CLAUDE.md.example instead.
+CLAUDE.md
+.chromadb/
+.auto_capture_state.json
+.recall_session_cache
+activity.log
+backlink_errors/
+
+# Environment
+.venv/
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+
+# Local Claude Code project settings (intentionally empty — hooks are global, see CLAUDE.md)
+.claude/
