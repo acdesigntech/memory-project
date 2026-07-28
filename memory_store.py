@@ -51,6 +51,19 @@ COLLECTION   = "memories"
 
 EPISODIC_BASE_STABILITY = 7  * 86400.0   # 7 days in seconds
 SEMANTIC_BASE_STABILITY = 90 * 86400.0   # 90 days in seconds
+CURATED_INITIAL_STABILITY = 30 * 86400.0 # 30 days -- starting stability for a brand-new
+                                          # ingest()'d (curated) memory. Deliberately between
+                                          # EPISODIC_BASE_STABILITY and SEMANTIC_BASE_STABILITY:
+                                          # a curated .md file was written up on purpose (unlike
+                                          # a jot() fragment, whose whole design bar is "cheap,
+                                          # low-effort, expected to decay unless reinforced" --
+                                          # see CLAUDE.md), so it shouldn't start on the same
+                                          # 7-day clock as a passing mention, but it also hasn't
+                                          # earned the 90-day semantic tier through actual
+                                          # reinforcement yet -- that's still consolidation's job.
+                                          # memory_type still starts "episodic" either way; this
+                                          # only changes the starting point on that clock, not
+                                          # the growth/cap/consolidation math.
 STABILITY_GROWTH        = 1.5            # multiplier on stability per recall
 STABILITY_CAP_FACTOR    = 10.0           # stability capped at base * this
 RETRIEVAL_FLOOR         = 0.1            # minimum strength to appear in recall()
@@ -189,6 +202,13 @@ def ingest(path: "Path | str") -> None:
     memory_type/consolidation_level) so a content update doesn't reset the
     memory's accumulated strength or silently demote a consolidated memory
     back to episodic.
+
+    A brand-new entry starts at CURATED_INITIAL_STABILITY (30 days), not
+    EPISODIC_BASE_STABILITY (7 days) -- a curated .md file was deliberately
+    written up, unlike a jot() fragment, so it shouldn't decay on the same
+    clock as a cheap unfiled mention. Still starts memory_type="episodic";
+    consolidation to the 90-day semantic tier still has to be earned via
+    reinforcement, same as any other episodic memory.
     """
     path = Path(path).resolve()
     if not path.exists() or path.suffix != ".md" or CORPUS_DIR not in path.parents:
@@ -214,7 +234,7 @@ def ingest(path: "Path | str") -> None:
         created_at          = now
         last_accessed       = now
         access_count        = 0
-        stability           = EPISODIC_BASE_STABILITY
+        stability           = CURATED_INITIAL_STABILITY
         memory_type         = "episodic"
         consolidation_level = 0
 
