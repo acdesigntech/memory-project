@@ -149,20 +149,45 @@ def _render_chunk(chunk: list[tuple[int, dict]]) -> str:
     return "\n\n".join(lines)
 
 
-def _run_extraction(transcript_text: str, cwd: str) -> list[dict]:
+# Kept under the SessionStart/SessionEnd hook timeout (300s, ~/.claude/settings.json)
+# so a single slow claude -p call gets a chance to time out cleanly on its own
+# rather than the whole hook process getting killed externally mid-call.
+EXTRACTION_TIMEOUT = 270
+
+
+def _start_extraction(transcript_text: str, cwd: str) -> subprocess.Popen | None:
+    """Launch one claude -p extraction subprocess without blocking on it.
+    Returns None if there's nothing worth extracting from (caller treats
+    that the same as a no-facts result)."""
     if not transcript_text.strip():
-        return []
+        return None
     prompt = EXTRACTION_PROMPT_TEMPLATE.format(cwd=cwd or "unknown", transcript_text=transcript_text)
     try:
-        result = subprocess.run(
+        return subprocess.Popen(
             ["claude", "-p", prompt],
-            capture_output=True, text=True, timeout=120,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
         )
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    except FileNotFoundError:
+        return None
+
+
+def _collect_extraction(proc: subprocess.Popen | None) -> list[dict]:
+    """Block until one already-running extraction subprocess finishes and
+    parse its output. Safe to call on several procs in sequence after they
+    were all started together -- each call only waits out whatever time is
+    left on that proc, since it's been running concurrently in the
+    background since _start_extraction returned."""
+    if proc is None:
         return []
-    if result.returncode != 0:
+    try:
+        stdout, _ = proc.communicate(timeout=EXTRACTION_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
         return []
-    raw = result.stdout.strip()
+    if proc.returncode != 0:
+        return []
+    raw = stdout.strip()
     # tolerate a model that wraps the array in a code fence despite instructions
     if raw.startswith("```"):
         raw = raw.strip("`")
@@ -177,40 +202,65 @@ def _run_extraction(transcript_text: str, cwd: str) -> list[dict]:
     return [f for f in facts if isinstance(f, dict) and f.get("text")]
 
 
-def capture_session(session_id: str, transcript_path: str) -> int:
-    path = Path(transcript_path)
-    if not path.exists():
-        return 0
+def capture_sessions_parallel(sessions: list[tuple[str, str]]) -> int:
+    """Process several sessions' new transcript content at once.
 
-    state = get_state(session_id)
-    from_line = state.get("last_finalized_line", 0)
+    The slow part -- one claude -p subprocess per chunk -- runs concurrently
+    across every session passed in, since each subprocess is fully
+    independent and touches neither ChromaDB nor capture_state.json.
+    Recording results (jot() + set_state()) happens back in this single
+    process, strictly sequentially, only after every subprocess has already
+    been started -- so there's never more than one writer touching the
+    ChromaDB store or the state file, without needing any locking.
+    """
+    session_jobs: dict[str, list[subprocess.Popen | None]] = {}
+    session_meta: dict[str, dict] = {}
 
-    entries = list(_iter_entries(path, from_line))
-    if not entries:
-        return 0
+    for session_id, transcript_path in sessions:
+        path = Path(transcript_path)
+        if not path.exists():
+            continue
 
-    new_max_line = entries[-1][0]
-    cwd = _last_cwd(entries) or state.get("cwd")
-    cwds_seen = set(state.get("cwds_seen", []))
-    for _, e in entries:
-        if "cwd" in e:
-            cwds_seen.add(e["cwd"])
+        state = get_state(session_id)
+        from_line = state.get("last_finalized_line", 0)
+        entries = list(_iter_entries(path, from_line))
+        if not entries:
+            continue
 
+        new_max_line = entries[-1][0]
+        cwd = _last_cwd(entries) or state.get("cwd")
+        cwds_seen = set(state.get("cwds_seen", []))
+        for _, e in entries:
+            if "cwd" in e:
+                cwds_seen.add(e["cwd"])
+
+        session_jobs[session_id] = [
+            _start_extraction(_render_chunk(chunk), cwd) for chunk in _chunk_entries(entries)
+        ]
+        session_meta[session_id] = {"new_max_line": new_max_line, "cwd": cwd, "cwds_seen": cwds_seen}
+
+    # Every subprocess above is already running in the background. Collecting
+    # them here is sequential, but each collect only blocks on time the proc
+    # hasn't already used up concurrently with the others -- total wall time
+    # is bounded by the slowest single job, not the sum of all of them.
     total_jotted = 0
-    for chunk in _chunk_entries(entries):
-        text = _render_chunk(chunk)
-        facts = _run_extraction(text, cwd)
-        for fact in facts:
-            jot(fact["text"], topic_hint=fact.get("topic_hint") or (Path(cwd).name if cwd else None))
-            total_jotted += 1
-
-    set_state(
-        session_id,
-        last_finalized_line=new_max_line,
-        cwd=cwd,
-        cwds_seen=sorted(cwds_seen),
-    )
+    for session_id, jobs in session_jobs.items():
+        meta = session_meta[session_id]
+        for proc in jobs:
+            for fact in _collect_extraction(proc):
+                jot(fact["text"], topic_hint=fact.get("topic_hint") or (Path(meta["cwd"]).name if meta["cwd"] else None))
+                total_jotted += 1
+        set_state(
+            session_id,
+            last_finalized_line=meta["new_max_line"],
+            cwd=meta["cwd"],
+            cwds_seen=sorted(meta["cwds_seen"]),
+        )
     return total_jotted
+
+
+def capture_session(session_id: str, transcript_path: str) -> int:
+    return capture_sessions_parallel([(session_id, transcript_path)])
 
 
 if __name__ == "__main__":

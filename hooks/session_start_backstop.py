@@ -126,11 +126,11 @@ def run():
 
     sys.path.insert(0, str(HOOK_DIR))
     from capture_state import get_state
-    from auto_capture import capture_session
+    from auto_capture import capture_sessions_parallel
 
     orphans = find_orphans(current_session_id, get_state)
-    for transcript, sid in orphans:
-        capture_session(sid, str(transcript))
+    if orphans:
+        capture_sessions_parallel([(sid, str(transcript)) for transcript, sid in orphans])
 
 
 def main():

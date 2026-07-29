@@ -42,6 +42,8 @@ EXCLUDE_TOPICS = {"financial", "health"}
 
 **When starting work in a new or unfamiliar project directory**: don't assume this system is irrelevant just because you're elsewhere. `recall()` a couple of likely queries early if the project seems related to prior work, and `jot()` as things come up during the session same as anywhere else.
 
+**A session may pause for a few minutes on startup — that's expected.** If the previous Claude Code session ended abnormally (crash, force-quit), the `SessionStart` hook that backstops capture for it runs a real `claude -p` subprocess to extract memories from the orphaned transcript before your new session's first prompt goes through. A single such call has been measured at ~2 minutes wall-clock. This isn't a hang; nothing needs to be restarted or interrupted.
+
 ## Project directory convention (optional — adapt to your own setup)
 
 If you keep multiple projects, consider a single standard parent directory for them (e.g. `~/projects/`) rather than scattering them loose — makes this system's `topic_hint` conventions and your own navigation more consistent. Not required by the tool itself, just a convention worth picking deliberately.

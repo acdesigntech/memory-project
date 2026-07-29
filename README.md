@@ -61,6 +61,10 @@ None of this is a knock on the built-in feature for what it's meant to be. It's 
 | 9 | Cued / associative recall | `recall_associative()` — surfaces weak "rings a bell" matches for human-in-the-loop confirmation |
 | 10 | Cold storage | `prune()` archives instead of deleting — non-destructive, human forgetting-shaped |
 
+### Capture timing
+
+Each finalize pass is a real `claude -p` subprocess call per transcript chunk — measured at ~2 minutes wall-clock even for a trivial extraction (mostly CLI/session startup overhead, not generation), so both the `SessionStart` and `SessionEnd` hooks are configured with a 300s timeout, not a short one. If a previous session ended abnormally, expect the *next* session's startup to pause for up to a few minutes while the `SessionStart` backstop catches it up — that's expected, not a hang. When a sweep has to catch up more than one orphaned session at once (capped at 3 per invocation), `capture_sessions_parallel()` runs their extraction subprocesses concurrently rather than one after another, so total wait time is bounded by the slowest single session, not the sum of all of them.
+
 ### Decay, made concrete
 
 `strength = exp(-t / stability)` is easy to skim past. In actual days, for a fresh `jot()` (episodic, 7-day base stability, never recalled again):
@@ -97,6 +101,10 @@ Start a new Claude Code session afterward (or restart a running one) to pick up 
 ## A macOS/Apple Silicon gotcha
 
 `numpy` linked against Apple's Accelerate BLAS framework has a **thread-safety bug**: `sklearn.metrics.pairwise.cosine_similarity` can produce different results across repeated runs on identical input (symptom: `RuntimeWarning: divide by zero / overflow / invalid value encountered in matmul`). Fix: set `os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")` **before any numpy/sklearn import**. Already baked into every script here — copy the guard into any new script you add that imports numpy/sklearn/sentence-transformers transitively.
+
+## Changelog
+
+See `CHANGELOG.md` for a dated history of notable changes.
 
 ## License
 

@@ -74,10 +74,10 @@ def build_hooks():
             "hooks": [{"type": "command", "command": f"{py} {REPO_DIR}/recall_hook.py", "timeout": 20}],
         }],
         "SessionEnd": [{
-            "hooks": [{"type": "command", "command": f"{py} {REPO_DIR}/hooks/session_end_capture.py", "timeout": 120}],
+            "hooks": [{"type": "command", "command": f"{py} {REPO_DIR}/hooks/session_end_capture.py", "timeout": 300}],
         }],
         "SessionStart": [{
-            "hooks": [{"type": "command", "command": f"{py} {REPO_DIR}/hooks/session_start_backstop.py", "timeout": 60}],
+            "hooks": [{"type": "command", "command": f"{py} {REPO_DIR}/hooks/session_start_backstop.py", "timeout": 300}],
         }],
     }
 
