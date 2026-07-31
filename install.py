@@ -40,20 +40,24 @@ def backup(path: Path):
     return backup_path
 
 
+VENV_BIN_DIR = "Scripts" if sys.platform == "win32" else "bin"
+EXE_SUFFIX = ".exe" if sys.platform == "win32" else ""
+
+
 def setup_venv():
     if not VENV_DIR.exists():
         print("Creating venv...")
         subprocess.run([sys.executable, "-m", "venv", str(VENV_DIR)], check=True)
     print("Installing dependencies (chromadb, sentence-transformers, numpy, scikit-learn)...")
     subprocess.run(
-        [str(VENV_DIR / "bin" / "pip"), "install", "-q",
+        [str(VENV_DIR / VENV_BIN_DIR / f"python{EXE_SUFFIX}"), "-m", "pip", "install", "-q",
          "chromadb", "sentence-transformers", "numpy", "scikit-learn"],
         check=True,
     )
 
 
 def python_bin():
-    return str(VENV_DIR / "bin" / "python")
+    return str(VENV_DIR / VENV_BIN_DIR / f"python{EXE_SUFFIX}")
 
 
 def build_hooks():
@@ -89,11 +93,14 @@ def install_hooks():
     settings.setdefault("hooks", {})
 
     repo_marker = str(REPO_DIR)
+    # json.dumps() re-escapes backslashes, so on Windows a raw path never matches
+    # inside its own dumped JSON — compare against the marker's escaped form instead.
+    repo_marker_json = json.dumps(repo_marker)[1:-1]
     for event, new_entries in build_hooks().items():
         existing = settings["hooks"].setdefault(event, [])
         # Drop any previous entries this installer wrote for this repo (idempotent re-run),
         # leaving any unrelated hooks for that same event alone.
-        existing[:] = [e for e in existing if repo_marker not in json.dumps(e)]
+        existing[:] = [e for e in existing if repo_marker_json not in json.dumps(e)]
         existing.extend(new_entries)
 
     SETTINGS_PATH.write_text(json.dumps(settings, indent=2) + "\n")
@@ -118,7 +125,7 @@ def install_claude_md():
     has_matched_pair = re.search(pattern, existing, flags=re.S) is not None
 
     if has_matched_pair:
-        existing = re.sub(pattern, block, existing, flags=re.S)
+        existing = re.sub(pattern, lambda _m: block, existing, flags=re.S)
         print(f"Updated existing memory-project block in {CLAUDE_MD_PATH} (rest of file untouched)")
     elif MARKER_START in existing or MARKER_END in existing:
         # A marker is present but unpaired (e.g. hand-edited) — don't guess, don't clobber.
