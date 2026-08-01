@@ -17,6 +17,7 @@ local_config.py
 activity.log
 backlink_errors/
 pending_rules.md
+regression_reports/
 
 # Environment
 .venv/
