@@ -16,6 +16,7 @@ local_config.py
 .recall_session_cache
 activity.log
 backlink_errors/
+pending_rules.md
 
 # Environment
 .venv/

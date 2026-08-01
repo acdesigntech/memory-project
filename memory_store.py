@@ -36,6 +36,7 @@ os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 
 import math
 import re
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -270,7 +271,7 @@ def ingest(path: "Path | str") -> None:
     _log_activity("ingest", doc_id, _topic_of(path), _title_of(text))
 
 
-def jot(text: str, session_id: str = "", topic_hint: str | None = None) -> str:
+def jot(text: str, session_id: str = "", topic_hint: str | None = None, category: str | None = None) -> str:
     """
     Cheap, unfiled capture for mid-session fragments — no backing file, no
     classify.py filing, no incremental_backlink.py cross-topic pass (too
@@ -287,6 +288,15 @@ def jot(text: str, session_id: str = "", topic_hint: str | None = None) -> str:
     participate in recall()'s cwd-based topic boost — including for a
     project that has no curated session_summaries/ folder yet, since
     _list_topics() also looks at topics already in the store.
+
+    category (added 2026-07-31, chain item 11): optional tag stored as real
+    metadata, not inferred from text content. "feedback" is the first
+    recognized value — lets find_feedback_patterns() query precisely for
+    feedback-type memories instead of guessing from a "Feedback (date): ..."
+    text-prefix convention, which is fragile for anything that needs to
+    filter on it reliably. None (the default) means untagged, same as before
+    this parameter existed.
+
     Returns the generated doc_id.
     """
     if topic_hint is None:
@@ -313,6 +323,7 @@ def jot(text: str, session_id: str = "", topic_hint: str | None = None) -> str:
             "capture_tier":        "fragment",
             "session_id":          session_id,
             "source_ids":          "",
+            "category":            category or "",
             "created_at":          now,
             "last_accessed":       now,
             "access_count":        0,
@@ -660,3 +671,148 @@ def revive_from_cold(doc_id: str) -> bool:
     col.update(ids=[doc_id], metadatas=[updated])
     _log_activity("revive", doc_id, m["topic"], m["title"])
     return True
+
+
+# ---------------------------------------------------------------- feedback pattern consolidation
+# Chain item 11 (2026-07-31): notice when several separate category="feedback" jot() fragments
+# describe the same recurring correction/preference, and promote that into an actual candidate
+# CLAUDE.md rule -- instead of that promotion only ever happening when a human manually notices
+# the repetition across sessions. See PROJECT_PLAN.md for the full motivation/design writeup.
+
+CONSOLIDATION_MIN_CLUSTER = 3
+CONSOLIDATION_SIMILARITY_THRESHOLD = 0.55
+PENDING_RULES_PATH = Path(__file__).resolve().parent / "pending_rules.md"
+
+FEEDBACK_DRAFT_PROMPT_TEMPLATE = """You are looking at {n} separate feedback notes a coding assistant recorded about the same recurring pattern in how it should behave, each written after a real correction or confirmation from the user. Synthesize them into ONE general standing rule, written in the same style already used in this project's CLAUDE.md: a clear rule statement, then a line starting with "**Why:**" explaining the reasoning, then a line starting with "**How to apply:**" explaining when it kicks in.
+
+Feedback notes:
+---
+{notes}
+---
+
+Output ONLY the rule in that three-part format, no other commentary."""
+
+
+def find_feedback_patterns(
+    min_cluster_size: int = CONSOLIDATION_MIN_CLUSTER,
+    similarity_threshold: float = CONSOLIDATION_SIMILARITY_THRESHOLD,
+) -> list[list[dict]]:
+    """
+    Pulls every non-archived fragment tagged category="feedback" and greedily clusters
+    them by embedding similarity, reusing the embeddings already computed at jot-time --
+    no new encoding work. Embeddings are stored L2-normalized, so cosine similarity
+    between two of them is just their dot product; no numpy needed at this scale.
+
+    Greedy single-link clustering, not a real clustering library -- consistent with this
+    project's existing preference for direct methods over pulling in a dependency for
+    something this small (same reasoning as classify.py's TF-IDF centroids or
+    apply_backlinks.py's threshold-based cross-topic linking).
+
+    Purely read-only. Returns a list of clusters, each a list of
+    {"id", "document", "meta"} dicts, one entry per cluster that reaches min_cluster_size.
+    """
+    col = _get_collection()
+    if col.count() == 0:
+        return []
+
+    all_entries = col.get(include=["metadatas", "documents", "embeddings"])
+    feedback = [
+        {"id": doc_id, "document": doc, "meta": meta, "embedding": emb}
+        for doc_id, doc, meta, emb in zip(
+            all_entries["ids"], all_entries["documents"], all_entries["metadatas"], all_entries["embeddings"]
+        )
+        if meta.get("category") == "feedback" and not meta.get("archived")
+    ]
+    if len(feedback) < min_cluster_size:
+        return []
+
+    def cosine(a, b):
+        return sum(x * y for x, y in zip(a, b))
+
+    n = len(feedback)
+    clustered = [False] * n
+    clusters = []
+    for i in range(n):
+        if clustered[i]:
+            continue
+        group = [i]
+        for j in range(i + 1, n):
+            if clustered[j]:
+                continue
+            if cosine(feedback[i]["embedding"], feedback[j]["embedding"]) >= similarity_threshold:
+                group.append(j)
+        if len(group) >= min_cluster_size:
+            for idx in group:
+                clustered[idx] = True
+            clusters.append([feedback[idx] for idx in group])
+
+    return clusters
+
+
+def draft_rule_from_cluster(cluster: list[dict]) -> str:
+    """
+    One claude -p subprocess call -- the same mechanism auto_capture.py already uses for
+    autonomous extraction -- synthesizing a cluster of feedback fragments into a single
+    candidate CLAUDE.md rule. Never writes anywhere itself; the caller routes the result
+    into the review queue. Returns "" on any failure (timeout, missing CLI, bad output) --
+    same silent-failure contract as the rest of this file's subprocess-based extraction.
+    """
+    notes = "\n\n".join(f"- {f['document']}" for f in cluster)
+    prompt = FEEDBACK_DRAFT_PROMPT_TEMPLATE.format(n=len(cluster), notes=notes)
+    try:
+        result = subprocess.run(
+            ["claude", "-p", prompt], capture_output=True, text=True, timeout=270,
+            env={**os.environ, NESTED_EXTRACTION_ENV_VAR: "1"},
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def review_feedback_patterns(
+    min_cluster_size: int = CONSOLIDATION_MIN_CLUSTER,
+    similarity_threshold: float = CONSOLIDATION_SIMILARITY_THRESHOLD,
+) -> int:
+    """
+    Run on demand -- not scheduled anywhere automatically, consistent with how prune()
+    also isn't automatically scheduled in this project today (v2 note in PROJECT_PLAN.md:
+    a SessionStart-surfaced version, "N pending rule suggestions," is the natural next
+    step, not required for v1).
+
+    Finds recurring feedback patterns via find_feedback_patterns(), drafts a candidate
+    rule for each via draft_rule_from_cluster(), and appends them to pending_rules.md for
+    human review. CLAUDE.md is never written to directly by this process -- it only
+    changes on explicit approval, since it's a standing instruction file, not something
+    that should get silently rewritten by a background process.
+
+    Returns the number of new candidate rules written.
+    """
+    clusters = find_feedback_patterns(min_cluster_size, similarity_threshold)
+    if not clusters:
+        return 0
+
+    if not PENDING_RULES_PATH.exists():
+        PENDING_RULES_PATH.write_text(
+            "# Pending Rules — Feedback Pattern Consolidation\n\n"
+            "Candidate CLAUDE.md rules drafted from recurring feedback patterns. Review "
+            "each, then manually add the ones worth keeping to CLAUDE.md and delete the "
+            "entry here. Nothing here is applied automatically.\n"
+        )
+
+    written = 0
+    new_entries = []
+    for cluster in clusters:
+        draft = draft_rule_from_cluster(cluster)
+        if not draft:
+            continue
+        stamp = time.strftime("%Y-%m-%d")
+        ids = ", ".join(f["id"] for f in cluster)
+        new_entries.append(f"\n## Candidate ({stamp}, from {len(cluster)} fragments: {ids})\n\n{draft}\n")
+        written += 1
+
+    if new_entries:
+        with open(PENDING_RULES_PATH, "a") as f:
+            f.write("".join(new_entries))
+    return written
