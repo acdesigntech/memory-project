@@ -82,7 +82,11 @@ def section(title: str) -> None:
 def test_jot_variants():
     section("jot() — metadata paths")
     id1 = ms.jot("Regression fact: default topic_hint should derive from cwd basename.")
-    id2 = ms.jot("Regression fact: explicit topic_hint override.", topic_hint=REGRESSION_TOPIC_PREFIX)
+    # unique marker on id2 -- generic phrasing like "explicit topic_hint override"
+    # can semantically match real corpus content (confirmed 2026-08-01: it kept
+    # reinforcing real feedback memories a little more on every regression run),
+    # so this and test_recall()'s query both need one to stay fully isolated.
+    id2 = ms.jot("Regression fact zzzregressionrecallmarkerzzz: explicit topic_hint override.", topic_hint=REGRESSION_TOPIC_PREFIX)
     id3 = ms.jot("Regression fact: tagged with category=feedback.", topic_hint=REGRESSION_TOPIC_PREFIX, category="feedback")
     id4 = ms.jot("Regression fact: tagged with an explicit session_id.", topic_hint=REGRESSION_TOPIC_PREFIX, session_id="regression-test-session-abc")
     _created_ids.extend([id1, id2, id3, id4])
@@ -99,12 +103,21 @@ def test_jot_variants():
         m[i]["capture_tier"] == "fragment" and m[i]["memory_type"] == "episodic" and m[i]["stability"] == ms.EPISODIC_BASE_STABILITY
         for i in (id1, id2, id3, id4)
     ))
+    # id1/id3/id4 aren't needed past this point -- purge now rather than letting
+    # them linger for the rest of the run. Found 2026-08-01: a lingering fixture
+    # doc from this function scored into test_recall_associative()'s CONFIDENT
+    # tier via generic word/marker-pattern overlap, silently defeating that
+    # test's own isolation guarantee. id2 is still needed by test_recall(),
+    # purged there instead once it's done with it.
+    ms.purge(id1)
+    ms.purge(id3)
+    ms.purge(id4)
     return id2  # reused by recall tests
 
 
 def test_recall(fact_id: str):
     section("recall() — matching, exclusion, topic boost")
-    query = "regression fact explicit topic_hint override"
+    query = "zzzregressionrecallmarkerzzz regression fact explicit topic_hint override"
 
     hits = ms.recall(query, n_results=3)
     check("recall() basic match surfaces the right doc top-ranked", hits and hits[0]["id"] == fact_id)
@@ -125,19 +138,29 @@ def test_recall(fact_id: str):
           math.isclose(after["stability"], expected_stability, rel_tol=1e-6),
           f"{after['stability']:.1f} vs expected {expected_stability:.1f}")
     check("recall() reinforcement increments access_count", after["access_count"] == before["access_count"] + 1)
+    ms.purge(fact_id)  # done with it -- don't let it linger and interfere with later tests' isolation
 
 
 def test_recall_associative():
     section("recall_associative() + confirm_activation()")
+    # unique marker, not generic-sounding text -- a query like "terse replies no
+    # summary" can and did semantically match unrelated REAL feedback memories
+    # in the corpus (confirmed 2026-08-01: it kept reinforcing a real memory a
+    # little more on every regression run), which both broke this test's exact-
+    # value math when that real memory happened to cross the consolidation cap,
+    # and was quietly polluting real corpus stability as an unintended side
+    # effect of running the suite repeatedly. A marker guarantees isolation.
+    marker = "zzzregressionclustermarkerzzz"
     ids = [
-        ms.jot("Regression cluster: prefers terse replies with no trailing summary.", topic_hint=REGRESSION_TOPIC_PREFIX, category="feedback"),
-        ms.jot("Regression cluster: annoyed by an unnecessary recap sentence.", topic_hint=REGRESSION_TOPIC_PREFIX, category="feedback"),
-        ms.jot("Regression cluster: explicitly said stop summarizing after finishing.", topic_hint=REGRESSION_TOPIC_PREFIX, category="feedback"),
+        ms.jot(f"Regression cluster {marker}: prefers terse replies with no trailing summary.", topic_hint=REGRESSION_TOPIC_PREFIX, category="feedback"),
+        ms.jot(f"Regression cluster {marker}: annoyed by an unnecessary recap sentence.", topic_hint=REGRESSION_TOPIC_PREFIX, category="feedback"),
+        ms.jot(f"Regression cluster {marker}: explicitly said stop summarizing after finishing.", topic_hint=REGRESSION_TOPIC_PREFIX, category="feedback"),
     ]
-    weak_id = ms.jot("Regression cluster loosely adjacent: something about writing style in general.", topic_hint=REGRESSION_TOPIC_PREFIX)
+    weak_id = ms.jot(f"Regression cluster {marker} loosely adjacent: something about writing style in general.", topic_hint=REGRESSION_TOPIC_PREFIX)
+    own_ids = set(ids + [weak_id])
     _created_ids.extend(ids + [weak_id])
 
-    res = ms.recall_associative("terse replies no summary recap stop summarizing", n_results=5, n_activated=5, topic_hint=REGRESSION_TOPIC_PREFIX)
+    res = ms.recall_associative(f"{marker} terse replies no summary recap stop summarizing", n_results=5, n_activated=5, topic_hint=REGRESSION_TOPIC_PREFIX)
     confident_ids = {h["id"] for h in res["confident"]}
     activated_ids = {h["id"] for h in res["activated"]}
 
@@ -146,8 +169,17 @@ def test_recall_associative():
           all(h["score"] >= ms.CONFIDENT_THRESHOLD for h in res["confident"]))
     check("recall_associative() activated tier only contains scores in the activation band",
           all(ms.ACTIVATION_FLOOR <= h["score"] < ms.CONFIDENT_THRESHOLD for h in res["activated"]))
+    # Real corpus content showing up in the ACTIVATED tier is fine and expected --
+    # that's associative recall's actual job (surfacing loosely related content),
+    # and the activated tier is never auto-reinforced. The CONFIDENT tier is
+    # different: those hits DO get auto-reinforced, so a real memory landing
+    # there would mean this test is polluting real corpus stability on every run
+    # (confirmed 2026-08-01 as the actual root cause of a flaky exact-value
+    # failure below, before the marker was added).
+    check("recall_associative() confident tier contains only this test's own marked fragments (no reinforcement pollution)",
+          all(h["id"] in own_ids for h in res["confident"]))
 
-    target = next((h for h in res["activated"]), None) or next((h for h in res["confident"]), None)
+    target = next((h for h in res["activated"] if h["id"] in own_ids), None) or next((h for h in res["confident"] if h["id"] in own_ids), None)
     if target is None:
         check("recall_associative()/confirm_activation() — usable candidate found", False, "no hit in either tier to test confirm_activation against")
         return
@@ -156,7 +188,12 @@ def test_recall_associative():
     before = col.get(ids=[target["id"]], include=["metadatas"])["metadatas"][0]
     ms.confirm_activation(target["id"])
     after = col.get(ids=[target["id"]], include=["metadatas"])["metadatas"][0]
-    expected = min(before["stability"] * ms.ACTIVATION_STABILITY_BOOST, ms.EPISODIC_BASE_STABILITY * ms.STABILITY_CAP_FACTOR)
+    episodic_cap = ms.EPISODIC_BASE_STABILITY * ms.STABILITY_CAP_FACTOR
+    boosted = min(before["stability"] * ms.ACTIVATION_STABILITY_BOOST, episodic_cap)
+    # mirror _maybe_consolidate()'s own trigger: hitting the episodic cap promotes
+    # to semantic and resets stability to SEMANTIC_BASE_STABILITY instead of
+    # leaving it at the capped value.
+    expected = ms.SEMANTIC_BASE_STABILITY if (before["memory_type"] == "episodic" and boosted >= episodic_cap) else boosted
     check("confirm_activation() applies the larger ACTIVATION_STABILITY_BOOST exactly",
           math.isclose(after["stability"], expected, rel_tol=1e-6),
           f"{after['stability']:.1f} vs expected {expected:.1f}")
@@ -441,6 +478,38 @@ def test_orphan_sweep_and_liveness():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_synthetic_transcript_sweep():
+    section("session_start_backstop.py — synthetic transcript cleanup sweep")
+    import session_start_backstop as backstop
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="regression-sweep-"))
+    fake_projects = tmpdir / "projects"
+    fake_project_dir = fake_projects / "-fake-project"
+    fake_project_dir.mkdir(parents=True)
+
+    synthetic_path = fake_project_dir / "synthetic-to-delete.jsonl"
+    real_path = fake_project_dir / "real-session-to-keep.jsonl"
+    synthetic_path.write_text(
+        '{"type":"user","message":{"content":"You are extracting durable, cross-session-worthy memories from a slice"}}\n'
+    )
+    real_path.write_text('{"type":"user","message":{"content":"a genuine user message"}}\n')
+
+    orig_projects_dir = backstop.PROJECTS_DIR
+    backstop.PROJECTS_DIR = fake_projects
+    try:
+        deleted = backstop.sweep_synthetic_transcripts()
+        check("sweep deletes exactly the synthetic transcript", deleted == 1)
+        check("synthetic file actually removed from disk", not synthetic_path.exists())
+        check("real session file left untouched", real_path.exists())
+
+        # idempotent: running again with nothing left to clean is a safe no-op
+        deleted2 = backstop.sweep_synthetic_transcripts()
+        check("second sweep with nothing synthetic left deletes 0", deleted2 == 0)
+    finally:
+        backstop.PROJECTS_DIR = orig_projects_dir
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_session_end_capture_live():
     section("session_end_capture.py — direct invocation (live claude -p)")
     import subprocess
@@ -663,6 +732,7 @@ def main():
         test_chunking_logic()
         test_capture_state()
         test_orphan_sweep_and_liveness()
+        test_synthetic_transcript_sweep()
         test_incremental_backlink()
         test_secondary_tools()
 
