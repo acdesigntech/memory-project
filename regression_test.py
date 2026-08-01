@@ -556,9 +556,16 @@ def test_recall_hook():
 
         out1 = run_hook("regression-test-hook-session-1", "zzzrecallhookmarkerzzz unique phrase for hook test")
         check("recall_hook.py produces hookSpecificOutput for a matching prompt", '"hookSpecificOutput"' in out1)
+        today_marker = datetime.now().strftime("%B %-d, %Y")
+        check("recall_hook.py includes current real date/time on first prompt",
+              "[Current date/time]" in out1 and today_marker in out1)
+        check("recall_hook.py includes the memory-recall marker on first prompt", "zzzrecallhookmarkerzzz" in out1)
 
         out2 = run_hook("regression-test-hook-session-1", "zzzrecallhookmarkerzzz unique phrase for hook test")
-        check("recall_hook.py session cache blocks a repeat call in the same session", out2 == "")
+        check("recall_hook.py session cache blocks the memory-recall portion on a repeat call",
+              "zzzrecallhookmarkerzzz" not in out2)
+        check("recall_hook.py STILL includes current date/time on a repeat call in the same session (not gated by the session cache)",
+              "[Current date/time]" in out2 and today_marker in out2)
 
         out3 = run_hook("regression-test-hook-session-2", "zzzrecallhookmarkerzzz unique phrase for hook test")
         check("recall_hook.py allows a fresh session_id to produce output again", '"hookSpecificOutput"' in out3)
