@@ -18,7 +18,7 @@ jot('...', topic_hint='<cwd-basename-or-project-name>')
 (`memory_store.py` resolves paths relative to its own file location, so this works unmodified from any project directory.)
 
 - **`jot(text, session_id='', topic_hint=None)`** — cheap, unfiled, mid-conversation capture. **Call this proactively, without being asked and without asking permission**, whenever something worth remembering across sessions comes up: a stated preference, a correction, a decision reached in conversation, something surprising or non-obvious. Bar is deliberately low — err toward jotting; the decay/reinforcement pipeline sorts out what matters over time. `topic_hint` defaults to cwd's basename; pass the current project's name explicitly when useful.
-- **`recall(query, n_results=5, exclude_topic=None, topic_hint=None)`** — semantic retrieval. A `UserPromptSubmit` hook already runs this automatically, but **only once per session, on the first prompt** — it will not fire again for anything raised later in the same conversation. Mid-conversation, `recall()` is on the assistant to call explicitly, not something a hook covers:
+- **`recall(query, n_results=5, exclude_topic=None, topic_hint=None)`** — semantic retrieval. A `UserPromptSubmit` hook already runs this automatically, but **only once per session, on the first prompt** — it will not fire again for anything raised later in the same conversation, even though that same hook now also does something else (real date/time injection, see below) on every prompt. Mid-conversation, `recall()` is on the assistant to call explicitly, not something a hook covers:
   - **Trigger**: the user references something specific (a name, a decision, a prior project detail, "remember when...") that isn't explained by the current conversation. This includes things there's only partial/thin context on, not only total unknowns.
   - This is a judgment call made live, not an automatic trigger — say when you're doing it (e.g. "let me check what's on record about X") rather than querying silently or guessing instead of checking.
   - Don't fire it reflexively on every message — it has real cost (each hit reinforces that memory's decay clock, and the embedding model adds latency). Reserve it for a genuine "I don't actually know this, or don't know it well enough" moment.
@@ -43,6 +43,12 @@ EXCLUDE_TOPICS = {"financial", "health"}
 **When starting work in a new or unfamiliar project directory**: don't assume this system is irrelevant just because you're elsewhere. `recall()` a couple of likely queries early if the project seems related to prior work, and `jot()` as things come up during the session same as anywhere else.
 
 **A session may pause for a few minutes on startup — that's expected.** If the previous Claude Code session ended abnormally (crash, force-quit), the `SessionStart` hook that backstops capture for it runs a real `claude -p` subprocess to extract memories from the orphaned transcript before your new session's first prompt goes through. A single such call has been measured at ~2 minutes wall-clock. This isn't a hang; nothing needs to be restarted or interrupted.
+
+## Time awareness in long sessions
+
+The same `UserPromptSubmit` hook (`recall_hook.py`) also injects real current date/time into context on **every** prompt, not gated by the once-per-session recall cache above — a long-running session can otherwise drift for hours past whatever time-of-day assumption was true when it started, with nothing prompting a re-check.
+
+That hook only fires when the user sends a new message — it does **not** refresh mid-turn during a lot of autonomous work without new user input (e.g. several wait/retry cycles on a long-running background task). Real time can pass there invisibly. **When elapsed time actually matters mid-turn** (before a time-sensitive claim, or after a long autonomous wait), run `date` directly rather than assuming or estimating from whatever timestamp the turn started with — same standard as verifying any other claim before stating it as fact.
 
 ## Project directory convention (optional — adapt to your own setup)
 
