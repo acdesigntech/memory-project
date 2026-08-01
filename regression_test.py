@@ -348,6 +348,7 @@ def test_orphan_sweep_and_liveness():
     orphan_sid = "genuine-orphan"
     processed_sid = "already-processed"
     crashed_sid = "crashed-with-partial-checkpoint"
+    synthetic_sid = "synthetic-extraction-call"
 
     (fake_project_dir / f"{current_sid}.jsonl").write_text('{"type":"user","message":{"content":"x"}}\n')
     (fake_project_dir / f"{orphan_sid}.jsonl").write_text('{"type":"user","message":{"content":"x"}}\n')
@@ -357,13 +358,22 @@ def test_orphan_sweep_and_liveness():
     (fake_project_dir / f"{crashed_sid}.jsonl").write_text(
         '{"type":"user","message":{"content":"x"}}\n{"type":"user","message":{"content":"y"}}\n'
     )
+    # Simulates this project's own claude -p extraction byproduct -- should
+    # never be treated as a real session candidate at all.
+    (fake_project_dir / f"{synthetic_sid}.jsonl").write_text(
+        '{"type":"user","message":{"content":"You are extracting durable, cross-session-worthy memories from a slice"}}\n'
+    )
+
+    fake_states = {
+        processed_sid: {"last_finalized_line": 1},  # matches its actual 1-line file -> not an orphan
+        crashed_sid: {"last_finalized_line": 1},  # partially captured before the crash
+    }
 
     def fake_get_state(sid):
-        if sid == processed_sid:
-            return {"last_finalized_line": 999}  # already covers everything -> not an orphan
-        if sid == crashed_sid:
-            return {"last_finalized_line": 1}  # partially captured before the crash
-        return {}
+        return dict(fake_states.get(sid, {}))
+
+    def fake_set_state(sid, **fields):
+        fake_states.setdefault(sid, {}).update(fields)
 
     lsof_calls = []
     real_is_open = backstop._is_open_by_a_process
@@ -372,27 +382,62 @@ def test_orphan_sweep_and_liveness():
         lsof_calls.append(path)
         return real_is_open(path)
 
+    read_calls = []
+    real_has_new_content = backstop._has_new_content
+
+    def counting_has_new_content(path, last_line):
+        read_calls.append(path)
+        return real_has_new_content(path, last_line)
+
     orig_projects_dir = backstop.PROJECTS_DIR
     orig_max = backstop.MAX_ORPHANS_PER_SWEEP
     backstop.PROJECTS_DIR = fake_projects
     backstop.MAX_ORPHANS_PER_SWEEP = 10  # don't let the cap hide a missing candidate
     backstop._is_open_by_a_process = counting_is_open
+    backstop._has_new_content = counting_has_new_content
     try:
-        orphans = backstop.find_orphans(current_sid, fake_get_state)
+        orphans = backstop.find_orphans(current_sid, fake_get_state, fake_set_state)
         orphan_sids = {sid for _, sid in orphans}
         check("find_orphans() excludes the current session", current_sid not in orphan_sids)
         check("find_orphans() excludes an already-fully-processed session", processed_sid not in orphan_sids)
         check("find_orphans() finds a genuine orphan", orphan_sid in orphan_sids)
         check("find_orphans() still detects a crashed session with a partial checkpoint",
               crashed_sid in orphan_sids)
+        check("synthetic claude -p extraction transcripts are never treated as candidates",
+              synthetic_sid not in orphan_sids)
+        check("synthetic transcripts never reach the read/lsof stages at all",
+              not any(p.stem == synthetic_sid for p in read_calls + lsof_calls))
         check("checkpoint-first ordering skips the lsof call for an already-processed session",
               not any(p.stem == processed_sid for p in lsof_calls))
         check("lsof is still called for sessions with genuinely new content",
               {p.stem for p in lsof_calls} == {orphan_sid, crashed_sid})
+        check("a confirmed-clean session gets its mtime cached", "checked_mtime" in fake_states.get(processed_sid, {}))
+
+        # second sweep, nothing on disk changed -- the mtime cache should skip
+        # the already-processed file's read entirely this time
+        read_calls.clear()
+        lsof_calls.clear()
+        orphans2 = backstop.find_orphans(current_sid, fake_get_state, fake_set_state)
+        check("mtime-cache hit skips re-reading an unchanged already-processed file",
+              not any(p.stem == processed_sid for p in read_calls))
+        check("second sweep still finds the same real orphan", orphan_sid in {sid for _, sid in orphans2})
+
+        # now the "processed" file's content genuinely changes -- cache must
+        # invalidate and the file must be re-examined, not skipped forever
+        processed_path = fake_project_dir / f"{processed_sid}.jsonl"
+        time.sleep(0.05)
+        processed_path.write_text('{"type":"user","message":{"content":"x"}}\n{"type":"user","message":{"content":"new"}}\n')
+        read_calls.clear()
+        orphans3 = backstop.find_orphans(current_sid, fake_get_state, fake_set_state)
+        check("mtime change invalidates the cache -- file gets re-read",
+              any(p.stem == processed_sid for p in read_calls))
+        check("newly-changed formerly-processed session is now detected as an orphan",
+              processed_sid in {sid for _, sid in orphans3})
     finally:
         backstop.PROJECTS_DIR = orig_projects_dir
         backstop.MAX_ORPHANS_PER_SWEEP = orig_max
         backstop._is_open_by_a_process = real_is_open
+        backstop._has_new_content = real_has_new_content
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
