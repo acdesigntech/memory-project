@@ -50,6 +50,8 @@ The same `UserPromptSubmit` hook (`recall_hook.py`) also injects real current da
 
 That hook only fires when the user sends a new message — it does **not** refresh mid-turn during a lot of autonomous work without new user input (e.g. several wait/retry cycles on a long-running background task). Real time can pass there invisibly. **When elapsed time actually matters mid-turn** (before a time-sensitive claim, or after a long autonomous wait), run `date` directly rather than assuming or estimating from whatever timestamp the turn started with — same standard as verifying any other claim before stating it as fact.
 
+**The hook delivering correct data is not the same as actually using it.** Having a fresh `[Current date/time]` line injected into context doesn't stop the reflex to reach for whatever time-of-day word a session's early framing already established ("tonight," "this morning," "overnight") — that word choice has to be actively checked against the injected value each time, not left to habit. Don't let the line sit in context unread.
+
 ## Project directory convention (optional — adapt to your own setup)
 
 If you keep multiple projects, consider a single standard parent directory for them (e.g. `~/projects/`) rather than scattering them loose — makes this system's `topic_hint` conventions and your own navigation more consistent. Not required by the tool itself, just a convention worth picking deliberately.
