@@ -1,7 +1,23 @@
 #!/usr/bin/env python3
 """
-UserPromptSubmit hook — surface relevant memories before Claude sees the first
-message of a session. Skips subsequent messages in the same session.
+UserPromptSubmit hook — two things, on different schedules.
+
+1. Real current date/time, injected on EVERY prompt, not just the first.
+   Found 2026-08-01: a long-running session drifted many hours past its own
+   starting context (which had opened in the evening) without ever re-
+   checking the actual time, leading to confidently wrong "goodnight" /
+   "still nighttime" framing well into the next afternoon. A jot()ted
+   reminder to "check the time" is a soft, semantically-gated fix -- it only
+   surfaces if some future prompt happens to score a recall() hit against
+   it. This is the actual fix: ground truth, unconditionally, every time,
+   cheap enough (a datetime call, no embeddings/ChromaDB) that there's no
+   reason to gate it at all.
+
+2. Relevant memories, surfaced before Claude sees the first message of a
+   session. Skips subsequent messages in the same session -- this part IS
+   gated, since repeating the same recalled context on every message would
+   be noisy and recall() itself has a real cost (embeddings + ChromaDB).
+
 Never blocks: exits 0 on any failure, logs to backlink_errors/.
 """
 
@@ -46,6 +62,11 @@ def extract_prompt(data: dict) -> str:
     return ""
 
 
+def format_time_context() -> str:
+    now = datetime.now().astimezone()
+    return f"[Current date/time] {now.strftime('%A, %B %-d, %Y, %-I:%M %p %Z')}"
+
+
 def format_context(hits: list[dict]) -> str:
     lines = ["[Memory context — relevant past sessions]", ""]
     for h in hits:
@@ -74,33 +95,34 @@ def run():
         return
 
     data = json.loads(raw)
-
     session_id = data.get("session_id", "")
-    if already_ran_this_session(session_id):
-        return
 
-    prompt = extract_prompt(data)
-    if not prompt:
-        return
+    context_parts = [format_time_context()]
 
-    cwd = data.get("cwd", "")
-    topic_hint = Path(cwd).name if cwd else None
+    if not already_ran_this_session(session_id):
+        prompt = extract_prompt(data)
+        if prompt:
+            cwd = data.get("cwd", "")
+            topic_hint = Path(cwd).name if cwd else None
 
-    sys.path.insert(0, str(HOOK_DIR))
-    from memory_store import recall
+            sys.path.insert(0, str(HOOK_DIR))
+            from memory_store import recall
 
-    hits = recall(prompt, n_results=N_RESULTS, topic_hint=topic_hint, exclude_topic=EXCLUDE_TOPICS)
-    hits = [h for h in hits if h["score"] >= MIN_SCORE]
+            hits = recall(prompt, n_results=N_RESULTS, topic_hint=topic_hint, exclude_topic=EXCLUDE_TOPICS)
+            hits = [h for h in hits if h["score"] >= MIN_SCORE]
 
-    mark_session(session_id)
+            mark_session(session_id)
 
-    if not hits:
-        return
+            if hits:
+                context_parts.append(format_context(hits))
+        # prompt empty -- deliberately don't mark_session, so a later prompt in
+        # this same session that DOES have extractable content still gets a
+        # shot at the memory-recall pass, matching the original retry behavior.
 
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
-            "additionalContext": format_context(hits),
+            "additionalContext": "\n\n".join(context_parts),
         }
     }))
 
