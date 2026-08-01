@@ -49,6 +49,17 @@ ACTIVITY_LOG = Path(__file__).resolve().parent / "activity.log"
 MODEL_NAME   = "all-MiniLM-L6-v2"
 COLLECTION   = "memories"
 
+# Set on every `claude -p` subprocess this project launches (auto_capture.py's
+# extraction calls, and any future callers of the same pattern). `claude -p` is a
+# full Claude Code invocation, subject to the SAME global SessionStart/SessionEnd
+# hooks as any real session -- without this guard, each extraction call re-triggers
+# session_start_backstop.py, including its orphan sweep, which can launch MORE
+# extraction subprocesses, which trigger the hook again, recursively. Found
+# 2026-07-31: an idle first-compaction catch-up spun up a growing tree of nested
+# claude -p / hook processes (confirmed via `ps` parent-chain tracing) that had to
+# be killed by hand. The hook scripts check for this var and no-op immediately.
+NESTED_EXTRACTION_ENV_VAR = "MEMORY_PROJECT_NESTED_EXTRACTION"
+
 EPISODIC_BASE_STABILITY = 7  * 86400.0   # 7 days in seconds
 SEMANTIC_BASE_STABILITY = 90 * 86400.0   # 90 days in seconds
 CURATED_INITIAL_STABILITY = 30 * 86400.0 # 30 days -- starting stability for a brand-new

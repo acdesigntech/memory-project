@@ -114,6 +114,15 @@ def find_orphans(current_session_id: str, get_state) -> list[Path]:
 
 
 def run():
+    # `claude -p` extraction subprocesses launched by this project (auto_capture.py,
+    # memory_store.py's draft_rule_from_cluster) are full Claude Code invocations and
+    # fire this same global SessionStart hook. Without this guard, an extraction call
+    # re-triggers the orphan sweep below, which can launch MORE extraction calls,
+    # which fire SessionStart again -- confirmed 2026-07-31 as a real runaway process
+    # tree that had to be killed by hand. The env var is set on every such subprocess.
+    if os.environ.get("MEMORY_PROJECT_NESTED_EXTRACTION"):
+        return
+
     raw = sys.stdin.read().strip()
     if not raw:
         return

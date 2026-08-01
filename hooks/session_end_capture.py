@@ -32,6 +32,11 @@ def log_error(exc):
 
 
 def run():
+    # See session_start_backstop.py for the full explanation -- claude -p extraction
+    # subprocesses are real Claude Code invocations subject to this same global hook.
+    if os.environ.get("MEMORY_PROJECT_NESTED_EXTRACTION"):
+        return
+
     raw = sys.stdin.read().strip()
     if not raw:
         return
