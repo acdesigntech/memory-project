@@ -347,26 +347,52 @@ def test_orphan_sweep_and_liveness():
     current_sid = "current-session-excluded"
     orphan_sid = "genuine-orphan"
     processed_sid = "already-processed"
+    crashed_sid = "crashed-with-partial-checkpoint"
 
     (fake_project_dir / f"{current_sid}.jsonl").write_text('{"type":"user","message":{"content":"x"}}\n')
     (fake_project_dir / f"{orphan_sid}.jsonl").write_text('{"type":"user","message":{"content":"x"}}\n')
     (fake_project_dir / f"{processed_sid}.jsonl").write_text('{"type":"user","message":{"content":"x"}}\n')
+    # Simulates an abrupt crash: one line was captured before it died, but a
+    # second line was written after that checkpoint and never got swept up.
+    (fake_project_dir / f"{crashed_sid}.jsonl").write_text(
+        '{"type":"user","message":{"content":"x"}}\n{"type":"user","message":{"content":"y"}}\n'
+    )
 
     def fake_get_state(sid):
         if sid == processed_sid:
             return {"last_finalized_line": 999}  # already covers everything -> not an orphan
+        if sid == crashed_sid:
+            return {"last_finalized_line": 1}  # partially captured before the crash
         return {}
 
+    lsof_calls = []
+    real_is_open = backstop._is_open_by_a_process
+
+    def counting_is_open(path):
+        lsof_calls.append(path)
+        return real_is_open(path)
+
     orig_projects_dir = backstop.PROJECTS_DIR
+    orig_max = backstop.MAX_ORPHANS_PER_SWEEP
     backstop.PROJECTS_DIR = fake_projects
+    backstop.MAX_ORPHANS_PER_SWEEP = 10  # don't let the cap hide a missing candidate
+    backstop._is_open_by_a_process = counting_is_open
     try:
         orphans = backstop.find_orphans(current_sid, fake_get_state)
         orphan_sids = {sid for _, sid in orphans}
         check("find_orphans() excludes the current session", current_sid not in orphan_sids)
         check("find_orphans() excludes an already-fully-processed session", processed_sid not in orphan_sids)
         check("find_orphans() finds a genuine orphan", orphan_sid in orphan_sids)
+        check("find_orphans() still detects a crashed session with a partial checkpoint",
+              crashed_sid in orphan_sids)
+        check("checkpoint-first ordering skips the lsof call for an already-processed session",
+              not any(p.stem == processed_sid for p in lsof_calls))
+        check("lsof is still called for sessions with genuinely new content",
+              {p.stem for p in lsof_calls} == {orphan_sid, crashed_sid})
     finally:
         backstop.PROJECTS_DIR = orig_projects_dir
+        backstop.MAX_ORPHANS_PER_SWEEP = orig_max
+        backstop._is_open_by_a_process = real_is_open
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 

@@ -61,12 +61,26 @@ def _session_id_from_path(path: Path) -> str:
     return path.stem  # <session-id>.jsonl -> <session-id>
 
 
-def _line_count(path: Path) -> int:
+def _has_new_content(path: Path, last_line: int) -> bool:
+    """True if `path` has more than `last_line` lines. find_orphans() only ever
+    needs this yes/no answer, never the exact count, so this stops reading the
+    instant it's proven true instead of counting the whole file every time
+    (replaces a full _line_count()). Found 2026-08-01: this machine's transcript
+    history is dominated by files that are already fully captured (checkpoint at
+    or near the file's true end) -- for that common case there's nothing to
+    short-circuit on until near EOF anyway, so this alone isn't a full fix (a
+    real-world timing run only moved ~13min -> ~9min, not the order-of-magnitude
+    the lsof-call-count reduction alone would suggest). It's still strictly
+    better than a full count and does meaningfully help the never-yet-captured
+    case (last_line=0 against a large file), so kept as a genuine improvement,
+    documented honestly rather than oversold."""
     n = 0
     with open(path, "r", errors="ignore") as f:
         for _ in f:
             n += 1
-    return n
+            if n > last_line:
+                return True
+    return False
 
 
 def _is_open_by_a_process(path: Path) -> bool:
@@ -98,16 +112,42 @@ def find_orphans(current_session_id: str, get_state) -> list[Path]:
                 mtime = transcript.stat().st_mtime
             except OSError:
                 continue
-            if _is_open_by_a_process(transcript):
-                continue  # a live process still has this open -- don't race it
+
+            # Cheap check first: most of this machine's transcript history is
+            # already fully captured (checkpointed via SessionEnd/backstop/compact
+            # over time) -- skip straight past those without ever shelling out to
+            # lsof. Found 2026-07-31: the old lsof-before-checkpoint-check order
+            # made every genuine session startup pay an lsof call per historical
+            # transcript regardless of whether it had anything new at all --
+            # confirmed at ~81ms/call x 9,507 files = ~13 min real-world cost.
+            # Safe regardless of order: get_state() was never a liveness signal,
+            # only a "how much has already been captured" one -- if there's
+            # nothing new, it's irrelevant whether the session is alive or dead,
+            # so it's always correct to skip the liveness check in that case. The
+            # abrupt-crash scenario this hook exists for still works: a crash
+            # interrupts active writing before a final checkpoint can run, so a
+            # crashed session's transcript almost always has content past its
+            # last checkpoint and still reaches the real lsof check below.
             state = get_state(sid)
             last_line = state.get("last_finalized_line", 0)
             try:
-                current_lines = _line_count(transcript)
+                has_new_content = _has_new_content(transcript, last_line)
             except OSError:
                 continue
-            if current_lines > last_line:
-                candidates.append((mtime, transcript, sid))
+            if not has_new_content:
+                continue  # nothing new -- no reason to even ask if it's live
+
+            # Only for sessions with genuinely new, uncaptured content does
+            # liveness actually matter. Deliberately NOT mtime-based -- a
+            # genuinely live session can sit open with zero writes for a long
+            # idle stretch (user stepped away mid-conversation) and must still be
+            # correctly detected as live; an mtime cutoff would misclassify that
+            # exact case as "safe," reintroducing the concurrent-writer race this
+            # check exists to prevent. lsof answers the real question directly.
+            if _is_open_by_a_process(transcript):
+                continue  # a live process still has this open -- don't race it
+
+            candidates.append((mtime, transcript, sid))
     # oldest-touched first -- clear the longest-abandoned backlog first
     candidates.sort(key=lambda c: c[0])
     return [(t, sid) for _, t, sid in candidates[:MAX_ORPHANS_PER_SWEEP]]
