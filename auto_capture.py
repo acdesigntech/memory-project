@@ -29,13 +29,14 @@ Design notes (see PROJECT_PLAN.md for full rationale):
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from capture_state import get_state, set_state
-from memory_store import jot
+from memory_store import jot, NESTED_EXTRACTION_ENV_VAR
 
 # Character budget per extraction chunk -- rough guard against feeding an
 # enormous stretch (no compact_boundary in it) to a single claude -p call.
@@ -166,6 +167,7 @@ def _start_extraction(transcript_text: str, cwd: str) -> subprocess.Popen | None
         return subprocess.Popen(
             ["claude", "-p", prompt],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            env={**os.environ, NESTED_EXTRACTION_ENV_VAR: "1"},
         )
     except FileNotFoundError:
         return None
@@ -213,7 +215,7 @@ def capture_sessions_parallel(sessions: list[tuple[str, str]]) -> int:
     been started -- so there's never more than one writer touching the
     ChromaDB store or the state file, without needing any locking.
     """
-    session_jobs: dict[str, list[subprocess.Popen | None]] = {}
+    session_jobs: dict[str, list[tuple[subprocess.Popen | None, int]]] = {}
     session_meta: dict[str, dict] = {}
 
     for session_id, transcript_path in sessions:
@@ -227,35 +229,49 @@ def capture_sessions_parallel(sessions: list[tuple[str, str]]) -> int:
         if not entries:
             continue
 
-        new_max_line = entries[-1][0]
         cwd = _last_cwd(entries) or state.get("cwd")
         cwds_seen = set(state.get("cwds_seen", []))
         for _, e in entries:
             if "cwd" in e:
                 cwds_seen.add(e["cwd"])
 
+        # each job is paired with its own chunk's last line number, not just the
+        # session's overall final line -- lets the collection loop below checkpoint
+        # after every chunk instead of only once at the very end of the whole batch.
         session_jobs[session_id] = [
-            _start_extraction(_render_chunk(chunk), cwd) for chunk in _chunk_entries(entries)
+            (_start_extraction(_render_chunk(chunk), cwd), chunk[-1][0])
+            for chunk in _chunk_entries(entries)
         ]
-        session_meta[session_id] = {"new_max_line": new_max_line, "cwd": cwd, "cwds_seen": cwds_seen}
+        session_meta[session_id] = {"cwd": cwd, "cwds_seen": cwds_seen}
 
     # Every subprocess above is already running in the background. Collecting
     # them here is sequential, but each collect only blocks on time the proc
     # hasn't already used up concurrently with the others -- total wall time
     # is bounded by the slowest single job, not the sum of all of them.
+    #
+    # Checkpointing happens after EACH chunk, not once at the end of a session's
+    # whole backlog. Found 2026-07-31: a session's first-ever compaction has no
+    # prior checkpoint, so it processes its entire transcript from scratch as
+    # many parallel claude -p chunk calls -- under heavy concurrent load (several
+    # of these hooks running at once across sessions) individual calls can take
+    # many minutes, well past the hook's own declared timeout. A kill mid-batch
+    # under the old once-at-the-end checkpoint lost 100% of that session's work
+    # with no partial credit and no error trace (an externally-killed process
+    # never reaches its own except block). Chunks are collected in file order, so
+    # line numbers stay monotonic across incremental checkpoints.
     total_jotted = 0
     for session_id, jobs in session_jobs.items():
         meta = session_meta[session_id]
-        for proc in jobs:
+        for proc, chunk_max_line in jobs:
             for fact in _collect_extraction(proc):
                 jot(fact["text"], topic_hint=fact.get("topic_hint") or (Path(meta["cwd"]).name if meta["cwd"] else None))
                 total_jotted += 1
-        set_state(
-            session_id,
-            last_finalized_line=meta["new_max_line"],
-            cwd=meta["cwd"],
-            cwds_seen=sorted(meta["cwds_seen"]),
-        )
+            set_state(
+                session_id,
+                last_finalized_line=chunk_max_line,
+                cwd=meta["cwd"],
+                cwds_seen=sorted(meta["cwds_seen"]),
+            )
     return total_jotted
 
 
