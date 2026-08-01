@@ -61,6 +61,38 @@ def _session_id_from_path(path: Path) -> str:
     return path.stem  # <session-id>.jsonl -> <session-id>
 
 
+# Distinctive opening text from this project's own claude -p prompt templates
+# (auto_capture.py's EXTRACTION_PROMPT_TEMPLATE, memory_store.py's
+# FEEDBACK_DRAFT_PROMPT_TEMPLATE). Every one-shot `claude -p` call this project
+# makes embeds its prompt as the first turn's content, so this is present on
+# line 1 of every transcript such a call produces.
+SYNTHETIC_CALL_SIGNATURES = (
+    "You are extracting durable, cross-session-worthy memories",
+    "separate feedback notes a coding assistant recorded",
+)
+
+
+def _is_synthetic_extraction_call(path: Path) -> bool:
+    """True if `path` is a transcript from this project's own claude -p
+    extraction machinery, not a real user session. Found 2026-08-01: of the
+    9,507 transcripts on this machine, 9,502 turned out to be exactly this --
+    a one-shot claude -p call (auto_capture.py's extraction, or chain-11's
+    draft_rule_from_cluster()) leaves behind its own tiny transcript file, and
+    since nothing legitimately captures these (they're not real conversations
+    worth extracting facts FROM), find_orphans() would otherwise re-examine an
+    ever-growing pile of them on every single sweep forever -- the checkpoint-
+    cache added earlier the same night can never mark them "clean" for the
+    same reason. This is the real fix: recognize and skip them outright,
+    before any of the other checks even run, rather than trying to make
+    re-examining them cheaper. Reads only the first line, not the whole file."""
+    try:
+        with open(path, "r", errors="ignore") as f:
+            first_line = f.readline()
+    except OSError:
+        return False
+    return any(sig in first_line for sig in SYNTHETIC_CALL_SIGNATURES)
+
+
 def _has_new_content(path: Path, last_line: int) -> bool:
     """True if `path` has more than `last_line` lines. find_orphans() only ever
     needs this yes/no answer, never the exact count, so this stops reading the
@@ -97,7 +129,7 @@ def _is_open_by_a_process(path: Path) -> bool:
     return result.returncode == 0
 
 
-def find_orphans(current_session_id: str, get_state) -> list[Path]:
+def find_orphans(current_session_id: str, get_state, set_state=None) -> list[Path]:
     if not PROJECTS_DIR.exists():
         return []
     candidates = []
@@ -108,12 +140,35 @@ def find_orphans(current_session_id: str, get_state) -> list[Path]:
             sid = _session_id_from_path(transcript)
             if sid == current_session_id:
                 continue  # never sweep the session that's just starting
+            if _is_synthetic_extraction_call(transcript):
+                continue  # this project's own claude -p byproduct, not a real session
             try:
                 mtime = transcript.stat().st_mtime
             except OSError:
                 continue
 
-            # Cheap check first: most of this machine's transcript history is
+            state = get_state(sid)
+
+            # Cache hit: this exact mtime was already confirmed clean (no new
+            # content) on a previous sweep, and the file hasn't been touched
+            # since -- skip without even opening it. Found 2026-08-01: after
+            # the checkpoint-first reorder below, a real-world timing run still
+            # cost ~9min, because the remaining bottleneck was opening and
+            # reading ~9,500 already-fully-processed files on every single
+            # sweep, forever, even though their content never changes again
+            # once a session ends. This is what actually answers Andrew's
+            # original mtime idea safely: not "recent mtime = might be live"
+            # (an absolute guess, wrong for a long-idle-but-genuinely-live
+            # session), but "mtime unchanged since I last checked = content is
+            # provably identical to last time" (a comparison against OUR OWN
+            # prior observation, not a guess about someone else's process).
+            # First sweep after this ships still pays the full ~9min to build
+            # the cache; every sweep after that should be dramatically faster
+            # for the ~9,500 files that are permanently static.
+            if state.get("checked_mtime") == mtime:
+                continue
+
+            # Cheap check next: most of this machine's transcript history is
             # already fully captured (checkpointed via SessionEnd/backstop/compact
             # over time) -- skip straight past those without ever shelling out to
             # lsof. Found 2026-07-31: the old lsof-before-checkpoint-check order
@@ -128,13 +183,14 @@ def find_orphans(current_session_id: str, get_state) -> list[Path]:
             # interrupts active writing before a final checkpoint can run, so a
             # crashed session's transcript almost always has content past its
             # last checkpoint and still reaches the real lsof check below.
-            state = get_state(sid)
             last_line = state.get("last_finalized_line", 0)
             try:
                 has_new_content = _has_new_content(transcript, last_line)
             except OSError:
                 continue
             if not has_new_content:
+                if set_state is not None:
+                    set_state(sid, checked_mtime=mtime)
                 continue  # nothing new -- no reason to even ask if it's live
 
             # Only for sessions with genuinely new, uncaptured content does
@@ -191,10 +247,10 @@ def run():
     if data.get("source") != "startup":
         return  # only sweep orphans on a genuinely fresh session, not resume/clear/fork
 
-    from capture_state import get_state
+    from capture_state import get_state, set_state
     from auto_capture import capture_sessions_parallel
 
-    orphans = find_orphans(current_session_id, get_state)
+    orphans = find_orphans(current_session_id, get_state, set_state)
     if orphans:
         capture_sessions_parallel([(sid, str(transcript)) for transcript, sid in orphans])
 
