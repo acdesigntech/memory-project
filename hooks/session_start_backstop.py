@@ -209,6 +209,35 @@ def find_orphans(current_session_id: str, get_state, set_state=None) -> list[Pat
     return [(t, sid) for _, t, sid in candidates[:MAX_ORPHANS_PER_SWEEP]]
 
 
+def sweep_synthetic_transcripts() -> int:
+    """Delete every claude -p extraction-call transcript found under
+    PROJECTS_DIR, using the same detection as the orphan sweep's own skip
+    check. Found 2026-08-01: without this, these accumulate indefinitely --
+    9,491 of 9,511 real transcripts on this machine turned out to be exactly
+    this, a one-time manual purge freed 545.7MB, and every future claude -p
+    call (including this hook's own orphan-capture calls) creates another
+    one. Runs every genuine session startup, uncapped (unlike the orphan
+    sweep's MAX_ORPHANS_PER_SWEEP) -- deletion is cheap (a single line read
+    per file, no lsof, no capture), so there's no backlog-pacing reason to
+    throttle it the way there is for orphan capture. Returns the count
+    deleted; never raises past its own OSError guard, since a corpus-hygiene
+    sweep should never be the thing that breaks a session startup."""
+    if not PROJECTS_DIR.exists():
+        return 0
+    deleted = 0
+    for project_dir in PROJECTS_DIR.iterdir():
+        if not project_dir.is_dir():
+            continue
+        for transcript in project_dir.glob("*.jsonl"):
+            if _is_synthetic_extraction_call(transcript):
+                try:
+                    transcript.unlink()
+                    deleted += 1
+                except OSError:
+                    continue
+    return deleted
+
+
 def run():
     # `claude -p` extraction subprocesses launched by this project (auto_capture.py,
     # memory_store.py's draft_rule_from_cluster) are full Claude Code invocations and
@@ -246,6 +275,8 @@ def run():
 
     if data.get("source") != "startup":
         return  # only sweep orphans on a genuinely fresh session, not resume/clear/fork
+
+    sweep_synthetic_transcripts()
 
     from capture_state import get_state, set_state
     from auto_capture import capture_sessions_parallel
