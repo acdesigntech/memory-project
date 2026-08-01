@@ -119,12 +119,29 @@ def run():
         return
     data = json.loads(raw)
 
-    if data.get("source") != "startup":
-        return  # only sweep on a genuinely fresh session, not resume/clear/compact/fork
-
     current_session_id = data.get("session_id", "")
 
     sys.path.insert(0, str(HOOK_DIR))
+
+    if data.get("source") == "compact":
+        # Mini consolidation cycle: a session that compacts many times but never hits SessionEnd
+        # (a long-running interactive session, or eventually the always-on Agent SDK backend) got
+        # ZERO enrichment for its entire runtime under the old startup-only logic -- everything
+        # about to become compacted/lossy just stayed that way until the session finally ended.
+        # This runs the same proven capture_session() extraction on THIS session's own transcript
+        # immediately after every compaction, so nothing has to wait until the end to be captured
+        # with full fidelity from the raw source. (2026-07-31 -- see CLAUDE.md for the full
+        # reasoning: PreCompact can't touch the compaction result itself, so the fix has to be
+        # "enrich memory from the raw transcript right after," not "intervene during compaction.")
+        transcript_path = data.get("transcript_path", "")
+        if transcript_path and current_session_id:
+            from auto_capture import capture_session
+            capture_session(current_session_id, transcript_path)
+        return
+
+    if data.get("source") != "startup":
+        return  # only sweep orphans on a genuinely fresh session, not resume/clear/fork
+
     from capture_state import get_state
     from auto_capture import capture_sessions_parallel
 
