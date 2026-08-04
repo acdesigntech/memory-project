@@ -46,6 +46,8 @@ os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 
 import math
 import re
+import shutil
+import sqlite3
 import subprocess
 import time
 import uuid
@@ -739,6 +741,48 @@ def prune() -> int:
     return len(to_archive)
 
 
+def _gc_orphaned_segments() -> int:
+    """
+    Remove on-disk segment directories under DB_DIR that chroma.sqlite3's own
+    `segments` table no longer references. This is the piece that actually makes
+    purge()'s rebuild (delete_collection() + create_collection()) delete anything:
+    delete_collection() drops the old segment cleanly from the `segments` table
+    (confirmed directly — only the live collection's segment rows exist afterward),
+    but it does NOT remove that segment's UUID-named directory from disk. The
+    directory — still holding the complete old hnswlib index, including whatever was
+    just "purged" — simply becomes unreferenced. Nothing in this Chroma version
+    (1.5.9) cleans it up on its own; confirmed empirically that a real corpus of
+    ~140 purge() calls left ~137 such orphaned directories sitting in .chromadb/,
+    each one a full, undeleted copy of a prior collection state.
+
+    Safe by construction: a directory is only a candidate for removal after
+    Chroma's own bookkeeping has already stopped referencing it, so this can never
+    touch anything the live collection still depends on. Called at the end of
+    purge() so cleanup happens as part of the same operation that orphaned the
+    directory, not as a separate maintenance step nothing schedules (the same
+    "nothing calls it automatically" failure mode prune() had — see "Lazy prune()
+    archiving" in PROJECT_PLAN.md — deliberately avoided here from the start).
+
+    Returns the count of directories removed.
+    """
+    sqlite_path = DB_DIR / "chroma.sqlite3"
+    if not sqlite_path.exists():
+        return 0
+
+    conn = sqlite3.connect(str(sqlite_path))
+    try:
+        live_ids = {row[0] for row in conn.execute("SELECT id FROM segments")}
+    finally:
+        conn.close()
+
+    removed = 0
+    for entry in DB_DIR.iterdir():
+        if entry.is_dir() and entry.name not in live_ids:
+            shutil.rmtree(entry)
+            removed += 1
+    return removed
+
+
 def purge(doc_id: str, tombstone: bool = False, reason: str = "") -> bool:
     """
     TRUE permanent deletion, bypassing cold storage entirely — removes a memory from the
@@ -762,13 +806,19 @@ def purge(doc_id: str, tombstone: bool = False, reason: str = "") -> bool:
     index (hnswlib-backed) is soft-delete only — a deleted vector's slot isn't necessarily
     zeroed or compacted, so the embedding can remain physically present in
     .chromadb/<uuid>/data_level0.bin until that slot happens to get reused by a future
-    insert (see PROJECT_PLAN.md's parking lot, "purge() doesn't scrub the underlying
-    vector index"). That directly undercuts purge()'s one stated job. The Chroma client
-    exposes no public compact/vacuum call (checked directly: neither PersistentClient nor
-    Collection has one in this version) — delete_collection() + create_collection() is the
-    only way to guarantee the old UUID-named directory (and everything physically in it)
-    is actually gone, not just soft-deleted. Cheap at this corpus's current size (a few
-    hundred entries); if the corpus grows into the tens of thousands this may need
+    insert. The Chroma client exposes no public compact/vacuum call (checked directly:
+    neither PersistentClient nor Collection has one in this version) — delete_collection()
+    + create_collection() moves the live collection to a brand-new on-disk segment
+    directory, which is necessary but NOT sufficient: delete_collection() cleanly drops
+    the old segment from chroma.sqlite3's own `segments` table (confirmed directly), but
+    it does NOT remove that segment's UUID-named directory from disk — it just orphans
+    it, still fully intact, still fully readable outside the Chroma API. Confirmed
+    empirically: every purge() call before this fix left exactly one such orphaned
+    directory behind, and a real corpus of ~140 purges had accumulated ~137 of them,
+    every one still holding a complete, undeleted copy of a "purged" collection's full
+    index. _gc_orphaned_segments() (below) is the actual fix — it's what makes the old
+    data genuinely gone, not the rebuild by itself. Cheap at this corpus's current size (a
+    few hundred entries); if the corpus grows into the tens of thousands this may need
     revisiting, but purge() is documented as rare/deliberate, not routine, so an O(corpus
     size) cost on every call is an acceptable trade for an infrequent operation.
 
@@ -801,6 +851,7 @@ def purge(doc_id: str, tombstone: bool = False, reason: str = "") -> bool:
             metadatas=[remaining["metadatas"][i] for i in keep],
         )
     _collection = new_col
+    _gc_orphaned_segments()
 
     if tombstone:
         reject_claim(text, reason=reason, topic_hint=meta.get("topic"), source_doc_id=doc_id)
