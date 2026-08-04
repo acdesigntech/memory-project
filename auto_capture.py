@@ -264,8 +264,9 @@ def capture_sessions_parallel(sessions: list[tuple[str, str]]) -> int:
         meta = session_meta[session_id]
         for proc, chunk_max_line in jobs:
             for fact in _collect_extraction(proc):
-                jot(fact["text"], topic_hint=fact.get("topic_hint") or (Path(meta["cwd"]).name if meta["cwd"] else None))
-                total_jotted += 1
+                jotted_id = jot(fact["text"], topic_hint=fact.get("topic_hint") or (Path(meta["cwd"]).name if meta["cwd"] else None))
+                if jotted_id is not None:
+                    total_jotted += 1
             set_state(
                 session_id,
                 last_finalized_line=chunk_max_line,
