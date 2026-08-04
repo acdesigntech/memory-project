@@ -315,6 +315,33 @@ def test_reject_claim_tombstone():
         _created_ids.append(other_retry)
 
 
+def test_lazy_archive_on_recall():
+    section("lazy archiving — recall() opportunistically archives a decayed candidate")
+    marker = f"zzzlazyarchiveregressionzzz{int(time.time())}"
+    text = f"Regression fact {marker}: artificially aged well past DELETION_FLOOR, never manually pruned."
+    cold_query = f"{marker} regression fact artificially aged past deletion floor never manually pruned"
+    doc_id = ms.jot(text, topic_hint=REGRESSION_TOPIC_PREFIX)
+    _created_ids.append(doc_id)
+
+    col = ms._get_collection()
+    m = col.get(ids=[doc_id], include=["metadatas"])["metadatas"][0]
+    # age it past the point where raw strength = exp(-age/stability) < DELETION_FLOOR
+    age_needed = m["stability"] * math.log(1 / ms.DELETION_FLOOR) + 3600
+    m["last_accessed"] = time.time() - age_needed
+    col.update(ids=[doc_id], metadatas=[m])
+    check("doc not yet archived before any recall() touches it", not col.get(ids=[doc_id], include=["metadatas"])["metadatas"][0].get("archived"))
+
+    hits = ms.recall(marker, n_results=10)
+    check("decayed doc invisible to recall() (already true via RETRIEVAL_FLOOR)", not any(h["id"] == doc_id for h in hits))
+
+    m_after = col.get(ids=[doc_id], include=["metadatas"])["metadatas"][0]
+    check("recall() lazily archived the decayed candidate with no prune() call anywhere in this test",
+          m_after.get("archived") is True and m_after.get("archived_at") is not None)
+
+    cold_hits = ms.recall_cold(cold_query, n_results=5)
+    check("lazily-archived doc is now reachable via recall_cold()", any(h["id"] == doc_id for h in cold_hits))
+
+
 def test_consolidation():
     section("episodic -> semantic consolidation trigger")
     doc_id = ms.jot("Regression fact: engineered to just barely trigger episodic-to-semantic consolidation.", topic_hint=REGRESSION_TOPIC_PREFIX)
@@ -781,6 +808,7 @@ def main():
         test_ingest()
         test_prune_cold_revive_purge()
         test_reject_claim_tombstone()
+        test_lazy_archive_on_recall()
         test_consolidation()
         test_chunking_logic()
         test_capture_state()

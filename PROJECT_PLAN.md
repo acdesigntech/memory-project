@@ -110,6 +110,16 @@ Closed the parking lot's next-highest-priority item, using the lighter fallback 
 - **Tombstones are invisible to ordinary retrieval** — `_score_hits()` (shared by `recall()`/`recall_associative()`) filters `capture_tier == "tombstone"` unconditionally, same pattern as the existing `archived` filter. `recall_cold()` already only matches `archived=True`, so tombstones (which are never archived) were never reachable there either — confirmed by reading, not just assumed.
 - **Verified**: new `test_reject_claim_tombstone()` in `regression_test.py` (7 checks) — `purge(tombstone=True)` leaves exactly one tombstone with the original text and correct `reason`/`source_ids`; a retry `jot()` of the same claim is refused; an unrelated `jot()` still succeeds; tombstones never surface via `recall()`; and critically, a **plain** `purge()` (no `tombstone=True`) does *not* block a later identical `jot()` — confirming the opt-in behavior actually stayed opt-in. Full regression suite: 80 passed, 0 failed.
 
+## Lazy prune() archiving (DONE 2026-08-04)
+
+Closed the parking lot's `prune()`-never-scheduled gap using the PowerMem lead it named: check decay/reachability lazily at retrieval time instead of standing up a background sweep or cron-equivalent, which this project's hook-driven architecture has no infrastructure for today.
+
+- **The gap being closed**: an entry that decayed below `DELETION_FLOOR` was already invisible to `recall()` (`RETRIEVAL_FLOOR` catches it regardless of `archived` state), but wasn't yet `archived=True` — so it also wasn't reachable via `recall_cold()` — until someone happened to run `prune()`'s full-corpus sweep by hand. In practice that left decayed memories in limbo indefinitely, since nothing ever called `prune()` automatically.
+- **`_archive_entry(col, doc_id, meta)`** — new shared helper (sets `archived=True`/`archived_at`, logs it) factored out of `prune()`'s loop so both `prune()` and the new lazy path can't drift on what "archived" means.
+- **`_score_hits()`** (shared by `recall()`/`recall_associative()`) now calls `_archive_entry()` the moment it encounters a raw candidate whose strength has dropped below `DELETION_FLOOR`, before the existing `RETRIEVAL_FLOOR` filter — so any decayed entry that surfaces as a nearest-neighbor candidate for a real query gets archived as a side effect of that query, no scheduler needed.
+- **Deliberately not exhaustive** — this only covers entries that actually surface as a candidate for some query. An entry nobody ever queries near stays unarchived until an explicit `prune()` sweep; `prune()` itself is unchanged in behavior (still the only guaranteed full-corpus pass) and now just reuses `_archive_entry()` internally.
+- **Verified**: new `test_lazy_archive_on_recall()` in `regression_test.py` — artificially ages a fresh `jot()` past `DELETION_FLOOR`, confirms it's *not* archived yet, calls `recall()` (never `prune()`), and confirms the entry is now `archived=True` and reachable via `recall_cold()` — with no `prune()` call anywhere in the test. Full regression suite: 84 passed, 0 failed.
+
 ## Status
 
 The core chain (items 1-11) is fully built. Next work comes from either promoting something out of the parking lot, or a new need surfacing.
@@ -117,8 +127,6 @@ The core chain (items 1-11) is fully built. Next work comes from either promotin
 ## Parking lot
 
 Deferred items — lower priority or currently blocked, not on the critical path of the chain above. Reordered 2026-08-03 after an external code review (Agent Memory Atlas: https://neoneye.github.io/agent-memory-atlas/systems/memory-project/) surfaced one new item and independently validated two others already here. The review's claims were checked directly against the code/tests before acting on any of them — its "no negative evals / no hook or capture-resumption tests" section is simply wrong (`regression_test.py` has `check("archived doc invisible to recall()", ...)` and dedicated `test_recall_hook()`/`test_capture_state()`/`test_session_end_capture_live()` functions, contradicting its own separate description of the archive/revive test elsewhere in the same report) — so its other claims were re-verified independently rather than taken on trust, not because the report is malicious, just not fully reliable.
-
-- **`prune()` never being called automatically** — still true, still not scheduled anywhere. Lead worth evaluating: PowerMem's approach of checking decay/reachability lazily at retrieval time instead of a background sweep — fits this project's existing hook-driven architecture (no scheduler infrastructure today) better than standing up a cron-equivalent.
 
 - **Auto-discovery of `CORPUS_DIR`** — unchanged, no new lead found anywhere on the Atlas. Still hardcoded relative to each script's own file location (`Path(__file__).resolve().parent / "session_summaries"`).
 
