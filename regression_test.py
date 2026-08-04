@@ -265,6 +265,7 @@ def test_prune_cold_revive_purge():
     check("revived doc visible to recall() again", any(h["id"] == doc_id for h in hits_after))
 
     ok_purge = ms.purge(doc_id)
+    col = ms._get_collection()  # purge() rebuilds the collection -- the old handle is now stale
     still_present = col.get(ids=[doc_id], include=["metadatas"])["ids"]
     check("purge() removes the doc completely", ok_purge and not still_present)
     check("purge() on a nonexistent id returns False, no crash", ms.purge("fragment/does-not-exist-regression") is False)

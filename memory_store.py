@@ -583,13 +583,51 @@ def purge(doc_id: str) -> bool:
     have been recorded in the first place (e.g. accidentally jotted sensitive content),
     not as routine cleanup — prune() is routine cleanup now, this is not.
     Returns True if found and deleted, False if doc_id doesn't exist.
+
+    Does a full REBUILD of the underlying Chroma collection (delete + recreate + re-add
+    every remaining entry), not just col.delete(ids=[doc_id]). Chroma's local persistent
+    index (hnswlib-backed) is soft-delete only — a deleted vector's slot isn't necessarily
+    zeroed or compacted, so the embedding can remain physically present in
+    .chromadb/<uuid>/data_level0.bin until that slot happens to get reused by a future
+    insert (see PROJECT_PLAN.md's parking lot, "purge() doesn't scrub the underlying
+    vector index"). That directly undercuts purge()'s one stated job. The Chroma client
+    exposes no public compact/vacuum call (checked directly: neither PersistentClient nor
+    Collection has one in this version) — delete_collection() + create_collection() is the
+    only way to guarantee the old UUID-named directory (and everything physically in it)
+    is actually gone, not just soft-deleted. Cheap at this corpus's current size (a few
+    hundred entries); if the corpus grows into the tens of thousands this may need
+    revisiting, but purge() is documented as rare/deliberate, not routine, so an O(corpus
+    size) cost on every call is an acceptable trade for an infrequent operation.
+
+    Side effect callers must know about: this replaces the module-level _collection
+    (a new Chroma-internal id, even though the name is unchanged), so ANY Collection
+    handle obtained via _get_collection() before this call is stale afterward — using it
+    raises chromadb's own NotFoundError (confirmed empirically: a stale handle fails
+    loudly, not silently). Call _get_collection() again after purge() rather than reusing
+    an old reference.
     """
+    global _collection
     col = _get_collection()
     existing = col.get(ids=[doc_id], include=["metadatas"])
     if not existing["ids"]:
         return False
     meta = existing["metadatas"][0]
-    col.delete(ids=[doc_id])
+
+    remaining = col.get(include=["metadatas", "documents", "embeddings"])
+    keep = [i for i, id_ in enumerate(remaining["ids"]) if id_ != doc_id]
+
+    client = chromadb.PersistentClient(path=str(DB_DIR))
+    client.delete_collection(name=COLLECTION)
+    new_col = client.create_collection(name=COLLECTION, metadata={"hnsw:space": "cosine"})
+    if keep:
+        new_col.add(
+            ids=[remaining["ids"][i] for i in keep],
+            embeddings=[remaining["embeddings"][i] for i in keep],
+            documents=[remaining["documents"][i] for i in keep],
+            metadatas=[remaining["metadatas"][i] for i in keep],
+        )
+    _collection = new_col
+
     _log_activity("purge", doc_id, meta["topic"], meta["title"])
     return True
 
