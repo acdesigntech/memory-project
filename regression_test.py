@@ -265,9 +265,54 @@ def test_prune_cold_revive_purge():
     check("revived doc visible to recall() again", any(h["id"] == doc_id for h in hits_after))
 
     ok_purge = ms.purge(doc_id)
+    col = ms._get_collection()  # purge() rebuilds the collection -- the old handle is now stale
     still_present = col.get(ids=[doc_id], include=["metadatas"])["ids"]
     check("purge() removes the doc completely", ok_purge and not still_present)
     check("purge() on a nonexistent id returns False, no crash", ms.purge("fragment/does-not-exist-regression") is False)
+
+
+def test_reject_claim_tombstone():
+    section("reject_claim() / purge(tombstone=True) — correction encoding")
+    marker = f"zzztombstoneregressionzzz{int(time.time())}"
+    wrong_text = f"Regression fact {marker}: the meeting is on Tuesday."
+    unrelated_text = f"Regression fact {marker} unrelated: pizza toppings preference is mushroom."
+
+    doc_id = ms.jot(wrong_text, topic_hint=REGRESSION_TOPIC_PREFIX)
+    _created_ids.append(doc_id)
+
+    ok_purge = ms.purge(doc_id, tombstone=True, reason="regression test — correcting to Thursday")
+    check("purge(tombstone=True) succeeds", ok_purge)
+
+    col = ms._get_collection()  # purge() rebuilds the collection -- stale handle otherwise
+    tombstones = col.get(where={"capture_tier": "tombstone"}, include=["metadatas", "documents"])
+    matching = [i for i, doc in enumerate(tombstones["documents"]) if doc == wrong_text]
+    check("purge(tombstone=True) leaves exactly one tombstone with the original text", len(matching) == 1)
+    if matching:
+        tmeta = tombstones["metadatas"][matching[0]]
+        check("tombstone records the reason and source_ids", tmeta.get("reason") == "regression test — correcting to Thursday" and tmeta.get("source_ids") == doc_id)
+        _created_ids.append(tombstones["ids"][matching[0]])
+
+    retry_id = ms.jot(wrong_text, topic_hint=REGRESSION_TOPIC_PREFIX)
+    check("jot() of a tombstoned claim is refused (returns None)", retry_id is None)
+
+    unrelated_id = ms.jot(unrelated_text, topic_hint=REGRESSION_TOPIC_PREFIX)
+    check("jot() of unrelated content still succeeds", unrelated_id is not None)
+    if unrelated_id:
+        _created_ids.append(unrelated_id)
+
+    hits = ms.recall(marker, n_results=10)
+    check("tombstone entries never surface via recall()", not any(h["id"].startswith("tombstone/") for h in hits))
+
+    # plain purge() (no tombstone) must NOT block a retry -- tombstoning is opt-in,
+    # not a side effect of every purge (see purge()'s own docstring on why).
+    other_marker = f"zzznotombstoneregressionzzz{int(time.time())}"
+    other_text = f"Regression fact {other_marker}: the sky is green today."
+    other_id = ms.jot(other_text, topic_hint=REGRESSION_TOPIC_PREFIX)
+    ms.purge(other_id)
+    other_retry = ms.jot(other_text, topic_hint=REGRESSION_TOPIC_PREFIX)
+    check("plain purge() (tombstone=False) does not block a later identical jot()", other_retry is not None)
+    if other_retry:
+        _created_ids.append(other_retry)
 
 
 def test_consolidation():
@@ -735,6 +780,7 @@ def main():
         test_recall_associative()
         test_ingest()
         test_prune_cold_revive_purge()
+        test_reject_claim_tombstone()
         test_consolidation()
         test_chunking_logic()
         test_capture_state()

@@ -24,9 +24,15 @@ Public API:
   revive_from_cold(id)       — call after the user confirms a recall_cold() hit is genuinely
                                the thing being recalled; un-archives it and refreshes it to
                                its memory-type's base stability, active again in ordinary recall.
-  purge(id)                  — TRUE permanent deletion, bypassing cold storage entirely. For
+  purge(id, tombstone=False) — TRUE permanent deletion, bypassing cold storage entirely. For
                                something that should never have been recorded, not routine
                                cleanup — prune() is routine cleanup now, purge() is not.
+                               Pass tombstone=True when purging because a fact was WRONG
+                               (not sensitive) — see reject_claim() below.
+  reject_claim(text)          — record a tombstone marking a claim as deliberately rejected,
+                               so jot() refuses to silently recreate it later (checked via
+                               _nearest_tombstone()). Normally called through
+                               purge(doc_id, tombstone=True) rather than directly.
 """
 
 from __future__ import annotations
@@ -81,6 +87,13 @@ STABILITY_CAP_FACTOR    = 10.0           # stability capped at base * this
 RETRIEVAL_FLOOR         = 0.1            # minimum strength to appear in recall()
 DELETION_FLOOR          = 0.02           # minimum strength before prune() archives (not deletes) it
 TOPIC_BOOST_FACTOR      = 1.5            # score multiplier for hits matching topic_hint
+TOMBSTONE_MATCH_THRESHOLD = 0.82         # raw similarity needed for jot() to treat a new claim as a
+                                          # repeat of a reject_claim()'d one and refuse to write it.
+                                          # Stricter than COLD_REVIVAL_THRESHOLD (0.6) on purpose: a
+                                          # false positive here silently drops a real fact with no
+                                          # human review anywhere in the loop (jot() is autonomous),
+                                          # which is worse than an occasional false negative letting
+                                          # a genuine restatement of an old correction through.
 COLD_REVIVAL_THRESHOLD  = 0.6            # raw similarity (not strength-weighted) needed for a cold/
                                           # archived memory to surface via recall_cold() at all. An
                                           # archived memory's decayed strength is frozen and meaningless
@@ -271,7 +284,7 @@ def ingest(path: "Path | str") -> None:
     _log_activity("ingest", doc_id, _topic_of(path), _title_of(text))
 
 
-def jot(text: str, session_id: str = "", topic_hint: str | None = None, category: str | None = None) -> str:
+def jot(text: str, session_id: str = "", topic_hint: str | None = None, category: str | None = None) -> str | None:
     """
     Cheap, unfiled capture for mid-session fragments — no backing file, no
     classify.py filing, no incremental_backlink.py cross-topic pass (too
@@ -297,7 +310,19 @@ def jot(text: str, session_id: str = "", topic_hint: str | None = None, category
     filter on it reliably. None (the default) means untagged, same as before
     this parameter existed.
 
-    Returns the generated doc_id.
+    Checked against reject_claim() tombstones before writing (see
+    _nearest_tombstone()): if this text is essentially a restatement of a claim
+    that was deliberately marked wrong (via purge(doc_id, tombstone=True)), the
+    write is refused rather than silently recreating it — the concrete gap this
+    closes is a fresh jot() (live, or an autonomous auto_capture.py
+    re-extraction pulling the same claim back out of a transcript that still
+    contains the original now-corrected conversation) recreating a corrected
+    fact at full stability like nothing happened. Not gated on human review —
+    same autonomous contract as the rest of jot().
+
+    Returns the generated doc_id, or None if the write was refused because it
+    matched a tombstone (see above) — callers that count successful jots
+    (e.g. auto_capture.py) should check for None rather than assuming success.
     """
     if topic_hint is None:
         topic_hint = Path(os.getcwd()).name
@@ -306,6 +331,11 @@ def jot(text: str, session_id: str = "", topic_hint: str | None = None, category
     doc_id    = f"fragment/{uuid.uuid4().hex}"
     title     = text.strip().split("\n", 1)[0][:80]
     embedding = _get_model().encode(text, normalize_embeddings=True).tolist()
+
+    tombstone = _nearest_tombstone(embedding)
+    if tombstone is not None:
+        _log_activity("blocked", doc_id, topic, f"[tombstone {tombstone['_similarity']}] {title[:50]}")
+        return None
 
     col = _get_collection()
     now = time.time()
@@ -331,6 +361,103 @@ def jot(text: str, session_id: str = "", topic_hint: str | None = None, category
         }],
     )
     _log_activity("jot", doc_id, topic, title)
+    return doc_id
+
+
+def _nearest_tombstone(embedding: list[float], threshold: float = TOMBSTONE_MATCH_THRESHOLD) -> dict | None:
+    """
+    Query the collection for the nearest reject_claim() tombstone to an already-computed
+    embedding (the caller's own, so jot() doesn't pay for a second encode() call on the
+    same text). Reuses Chroma's `where` filter rather than a separate vector store — see
+    reject_claim()'s docstring for why tombstones live in the same collection instead of
+    a second index. Returns the matching tombstone's metadata (plus a "_similarity" key)
+    if it clears `threshold`, else None.
+    """
+    col = _get_collection()
+    if col.count() == 0:
+        return None
+    raw = col.query(
+        query_embeddings=[embedding],
+        n_results=min(col.count(), 5),
+        where={"capture_tier": "tombstone"},
+        include=["metadatas", "distances"],
+    )
+    if not raw["ids"][0]:
+        return None
+    similarity = 1.0 - raw["distances"][0][0]
+    if similarity < threshold:
+        return None
+    meta = dict(raw["metadatas"][0][0])
+    meta["_similarity"] = round(similarity, 4)
+    return meta
+
+
+def reject_claim(text: str, reason: str = "", topic_hint: str | None = None, source_doc_id: str = "") -> str:
+    """
+    Record a tombstone: a claim that was deliberately marked wrong and must not be
+    allowed to silently reappear. This is the piece purge() alone couldn't provide —
+    purge() only removes the CURRENT row; nothing was left behind for a future write to
+    check against, so a fresh jot() of the same claim (live, or an autonomous
+    auto_capture.py re-extraction pulling it back out of a transcript that still
+    contains the original conversation) would happily recreate it at full stability
+    like nothing happened. _nearest_tombstone(), called from jot(), is the check that
+    closes that gap.
+
+    Deliberately the OPPOSITE of purge()'s own "make it truly gone" guarantee: a
+    tombstone keeps the rejected claim's embedding around on purpose, because the whole
+    point is recognizing when the same wrong claim comes back. That's why this is a
+    separate function rather than something purge() always does — purge()'s other use
+    case (content that should never have existed at all, e.g. accidentally-jotted
+    secrets) wants the opposite of that. Use purge(doc_id, tombstone=True) when a fact
+    was wrong and needs to STAY corrected; use plain purge(doc_id) when something
+    should never have been recorded at all and the embedding itself must not persist.
+
+    Stored in the same Chroma collection as ordinary memories (capture_tier=
+    "tombstone"), reusing its existing nearest-neighbor index rather than standing up a
+    second vector store — the same "reuse what's already there" call this project made
+    for find_feedback_patterns()'s embedding reuse. Excluded from recall(),
+    recall_associative(), and recall_cold() entirely (see _score_hits() and
+    recall_cold()) — a tombstone is metadata about what NOT to write, never itself a
+    retrievable memory. Has no decay/reinforcement curve; it's permanent by design,
+    matching purge()'s own permanence, until explicitly removed via purge().
+
+    Returns the generated tombstone doc_id.
+    """
+    if topic_hint is None:
+        topic_hint = Path(os.getcwd()).name
+    topic = _match_topic(topic_hint) or topic_hint or "unfiled"
+
+    doc_id    = f"tombstone/{uuid.uuid4().hex}"
+    title     = text.strip().split("\n", 1)[0][:80]
+    embedding = _get_model().encode(text, normalize_embeddings=True).tolist()
+
+    col = _get_collection()
+    now = time.time()
+    col.upsert(
+        ids=[doc_id],
+        documents=[text],
+        embeddings=[embedding],
+        metadatas=[{
+            "file_path":           "",
+            "title":               title,
+            "topic":               topic,
+            "memory_type":         "episodic",
+            "consolidation_level": 0,
+            "capture_tier":        "tombstone",
+            "session_id":          "",
+            "source_ids":          source_doc_id,
+            "category":            "",
+            "reason":              reason,
+            "created_at":          now,
+            "last_accessed":       now,
+            "access_count":        0,
+            "stability":           SEMANTIC_BASE_STABILITY,  # unused (tombstones are never
+            # decay-scored -- see _score_hits()'s unconditional skip); kept only so this
+            # entry's metadata shape matches the rest of the collection rather than
+            # having ad hoc missing keys.
+        }],
+    )
+    _log_activity("reject", doc_id, topic, title)
     return doc_id
 
 
@@ -373,6 +500,8 @@ def _score_hits(
     ):
         if meta["topic"] in exclude_topics:
             continue
+        if meta.get("capture_tier") == "tombstone":
+            continue  # metadata about what NOT to write, never itself a retrievable memory
         if meta.get("archived"):
             continue  # cold storage -- excluded from ordinary recall entirely, see recall_cold()
 
@@ -576,20 +705,72 @@ def prune() -> int:
     return len(to_archive)
 
 
-def purge(doc_id: str) -> bool:
+def purge(doc_id: str, tombstone: bool = False, reason: str = "") -> bool:
     """
     TRUE permanent deletion, bypassing cold storage entirely — removes a memory from the
     store with no way to recall_cold() it back. Use only for something that should never
     have been recorded in the first place (e.g. accidentally jotted sensitive content),
     not as routine cleanup — prune() is routine cleanup now, this is not.
     Returns True if found and deleted, False if doc_id doesn't exist.
+
+    tombstone=False (default) is plain hard deletion — nothing of the purged content
+    survives anywhere, which is exactly right for "this should never have been recorded"
+    (the accidentally-jotted-secret case above). Pass tombstone=True instead when the
+    purge is because a fact turned out to be WRONG, not sensitive: it additionally calls
+    reject_claim() with the purged text before it's gone, so a future jot() (live, or an
+    autonomous auto_capture.py re-extraction of a transcript that still contains the
+    original conversation) can't silently recreate the same wrong claim — see
+    reject_claim()'s own docstring for why that has to be an opt-in rather than always-on
+    behavior here. `reason` is passed through to the tombstone when set.
+
+    Does a full REBUILD of the underlying Chroma collection (delete + recreate + re-add
+    every remaining entry), not just col.delete(ids=[doc_id]). Chroma's local persistent
+    index (hnswlib-backed) is soft-delete only — a deleted vector's slot isn't necessarily
+    zeroed or compacted, so the embedding can remain physically present in
+    .chromadb/<uuid>/data_level0.bin until that slot happens to get reused by a future
+    insert (see PROJECT_PLAN.md's parking lot, "purge() doesn't scrub the underlying
+    vector index"). That directly undercuts purge()'s one stated job. The Chroma client
+    exposes no public compact/vacuum call (checked directly: neither PersistentClient nor
+    Collection has one in this version) — delete_collection() + create_collection() is the
+    only way to guarantee the old UUID-named directory (and everything physically in it)
+    is actually gone, not just soft-deleted. Cheap at this corpus's current size (a few
+    hundred entries); if the corpus grows into the tens of thousands this may need
+    revisiting, but purge() is documented as rare/deliberate, not routine, so an O(corpus
+    size) cost on every call is an acceptable trade for an infrequent operation.
+
+    Side effect callers must know about: this replaces the module-level _collection
+    (a new Chroma-internal id, even though the name is unchanged), so ANY Collection
+    handle obtained via _get_collection() before this call is stale afterward — using it
+    raises chromadb's own NotFoundError (confirmed empirically: a stale handle fails
+    loudly, not silently). Call _get_collection() again after purge() rather than reusing
+    an old reference.
     """
+    global _collection
     col = _get_collection()
-    existing = col.get(ids=[doc_id], include=["metadatas"])
+    existing = col.get(ids=[doc_id], include=["metadatas", "documents"])
     if not existing["ids"]:
         return False
     meta = existing["metadatas"][0]
-    col.delete(ids=[doc_id])
+    text = existing["documents"][0]
+
+    remaining = col.get(include=["metadatas", "documents", "embeddings"])
+    keep = [i for i, id_ in enumerate(remaining["ids"]) if id_ != doc_id]
+
+    client = chromadb.PersistentClient(path=str(DB_DIR))
+    client.delete_collection(name=COLLECTION)
+    new_col = client.create_collection(name=COLLECTION, metadata={"hnsw:space": "cosine"})
+    if keep:
+        new_col.add(
+            ids=[remaining["ids"][i] for i in keep],
+            embeddings=[remaining["embeddings"][i] for i in keep],
+            documents=[remaining["documents"][i] for i in keep],
+            metadatas=[remaining["metadatas"][i] for i in keep],
+        )
+    _collection = new_col
+
+    if tombstone:
+        reject_claim(text, reason=reason, topic_hint=meta.get("topic"), source_doc_id=doc_id)
+
     _log_activity("purge", doc_id, meta["topic"], meta["title"])
     return True
 
