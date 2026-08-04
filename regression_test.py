@@ -33,7 +33,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import time
@@ -269,6 +271,26 @@ def test_prune_cold_revive_purge():
     still_present = col.get(ids=[doc_id], include=["metadatas"])["ids"]
     check("purge() removes the doc completely", ok_purge and not still_present)
     check("purge() on a nonexistent id returns False, no crash", ms.purge("fragment/does-not-exist-regression") is False)
+
+
+def test_purge_gc_orphaned_segments():
+    section("purge() — no orphaned on-disk segment directories left behind")
+    # The bug this guards against: delete_collection() drops the old segment
+    # cleanly from chroma.sqlite3's own `segments` table, but never removes that
+    # segment's UUID-named directory from disk -- it just orphans it, still fully
+    # intact. purge()'s rebuild alone doesn't fix that; _gc_orphaned_segments()
+    # (called at the end of purge()) is what actually removes it.
+    doc_id = ms.jot("Regression fact: purge() must not leak an orphaned segment directory.", topic_hint=REGRESSION_TOPIC_PREFIX)
+    ms.purge(doc_id)
+
+    sqlite_path = ms.DB_DIR / "chroma.sqlite3"
+    conn = sqlite3.connect(str(sqlite_path))
+    live_ids = {row[0] for row in conn.execute("SELECT id FROM segments")}
+    conn.close()
+
+    all_dirs = {d for d in os.listdir(ms.DB_DIR) if os.path.isdir(os.path.join(ms.DB_DIR, d))}
+    orphaned = all_dirs - live_ids
+    check("no orphaned segment directories remain on disk after purge()", not orphaned, f"found {len(orphaned)}: {orphaned}")
 
 
 def test_reject_claim_tombstone():
@@ -807,6 +829,7 @@ def main():
         test_recall_associative()
         test_ingest()
         test_prune_cold_revive_purge()
+        test_purge_gc_orphaned_segments()
         test_reject_claim_tombstone()
         test_lazy_archive_on_recall()
         test_consolidation()

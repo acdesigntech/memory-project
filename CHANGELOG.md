@@ -2,6 +2,20 @@
 
 Notable changes to this project, newest first. No version tags/releases — this is a live, continuously-evolving personal system, so entries are dated instead.
 
+## 2026-08-04 — Fix purge() actually leaking on-disk data (follow-up to the same day's earlier fix)
+
+`purge()`'s collection-rebuild fix from earlier today was incomplete: `delete_collection()` cleanly drops the old segment from Chroma's own `segments` table, but never removes that segment's UUID-named directory from disk — it just orphans it, still fully intact and readable outside the Chroma API. Every `purge()` call since the earlier fix shipped had been leaking one of these; the real `.chromadb/` had accumulated ~137 orphaned directories from one session's testing.
+
+### Fixed
+
+- `_gc_orphaned_segments()` — new helper, called at the end of `purge()`, diffs on-disk UUID directories against `chroma.sqlite3`'s live `segments` table and removes anything unreferenced. This, not the rebuild alone, is what actually makes purged data gone from disk.
+- Ran against the real store with confirmation: all ~137 pre-existing orphaned directories removed, `.chromadb/` went from 138 directories to 1, real corpus (190 entries) confirmed intact.
+
+### Docs
+
+- `PROJECT_PLAN.md`: corrected the earlier "purge() vector-index scrub" entry's wrong claim in place, added a new "purge() orphaned segment directories" section documenting the real fix and the root cause of the original miss (verification checked collection identity and count, never the filesystem).
+- `regression_test.py`: new `test_purge_gc_orphaned_segments()`. Full suite: 85 passed, 0 failed.
+
 ## 2026-08-04 — purge() vector-index scrub, correction-encoding tombstones, lazy prune() archiving
 
 Closed three of the four items from the 2026-08-03 parking-lot reprioritization (external code review). Only "auto-discovery of `CORPUS_DIR`" remains.
