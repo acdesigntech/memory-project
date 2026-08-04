@@ -2,6 +2,33 @@
 
 Notable changes to this project, newest first. No version tags/releases — this is a live, continuously-evolving personal system, so entries are dated instead.
 
+## 2026-08-04 — purge() vector-index scrub, correction-encoding tombstones, lazy prune() archiving
+
+Closed three of the four items from the 2026-08-03 parking-lot reprioritization (external code review). Only "auto-discovery of `CORPUS_DIR`" remains.
+
+### Fixed
+
+- `purge(doc_id)` previously only called `col.delete(ids=[doc_id])` on the Chroma collection — a soft delete against its hnswlib-backed persistent index, so a "permanently" purged embedding could remain physically present in `.chromadb/*/data_level0.bin` until that slot got reused by a future insert. `purge()` now does a full collection rebuild instead (fetch every remaining entry, `delete_collection()`, recreate, re-add everything except the purged doc) — the only available guarantee, since neither `PersistentClient` nor `Collection` exposes a compact/vacuum call in this Chroma version. O(corpus size) instead of O(1), an accepted tradeoff since `purge()` is rare/deliberate, not routine.
+- `regression_test.py`'s `test_prune_cold_revive_purge()` cached a `Collection` handle before calling `purge()` and reused it afterward — `purge()`'s rebuild replaces the module-level handle, so a cached one goes stale (raises Chroma's `NotFoundError`). Fixed by re-fetching after the call.
+- `prune()`'s full-corpus sweep was never called automatically — a memory that decayed below `DELETION_FLOOR` was already invisible to `recall()` (`RETRIEVAL_FLOOR` catches it regardless of `archived` state) but sat unarchived, and therefore unreachable via `recall_cold()`, until someone ran `prune()` by hand.
+
+### Added
+
+- `reject_claim(text, reason='', topic_hint=None, source_doc_id='')` — records a tombstone (a claim deliberately marked wrong) in the same Chroma collection as ordinary memories (`capture_tier="tombstone"`), reusing the existing nearest-neighbor index rather than a second vector store.
+- `purge(doc_id, tombstone=False, reason='')` — gained an opt-in `tombstone` param. `tombstone=True` calls `reject_claim()` with the purged text right after the rebuild, so a corrected-and-purged fact can't silently reappear. Deliberately not automatic: plain `purge()` (the accidentally-jotted-secret case) needs the embedding to actually vanish, the opposite of what a tombstone wants.
+- `jot()` now checks `_nearest_tombstone()` before writing (reusing its own already-computed embedding) and refuses the write — returns `None` instead of a doc_id — if the new text is a near-duplicate (>=0.82 raw cosine similarity, `TOMBSTONE_MATCH_THRESHOLD`) of a rejected claim. This is what stops a corrected fact from resurrecting itself via a later `jot()` or an autonomous `auto_capture.py` re-extraction. `jot()`'s return type is now `str | None`.
+- `_archive_entry(col, doc_id, meta)` — shared archiving helper factored out of `prune()`'s loop. `_score_hits()` (shared by `recall()`/`recall_associative()`) now calls it the moment a raw candidate's strength drops below `DELETION_FLOOR`, so a decayed memory gets archived as a side effect of the next real query that happens to surface it — no scheduler/cron needed (PowerMem's lazy-at-retrieval-time lead). Not exhaustive: an entry nobody ever queries near still only gets archived by an explicit `prune()` sweep.
+
+### Changed
+
+- `auto_capture.py`'s `jot()` call site now only counts a jot as successful when the return value isn't `None`, to match `jot()`'s new tombstone-refusal behavior.
+- `_score_hits()` filters out `capture_tier == "tombstone"` entries unconditionally, same pattern as the existing `archived` filter — tombstones are metadata about what *not* to write, never themselves a retrievable memory.
+
+### Docs
+
+- `PROJECT_PLAN.md`: three new `## ... (DONE 2026-08-04)` sections (purge() vector-index scrub, correction encoding, lazy prune() archiving), each moved out of the parking lot.
+- `regression_test.py`: new `test_reject_claim_tombstone()` (7 checks) and `test_lazy_archive_on_recall()`. Full suite: 84 passed, 0 failed.
+
 ## 2026-07-29 — Fix SessionStart/SessionEnd hook timeouts; parallelize orphan capture
 
 ### Fixed
