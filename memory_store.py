@@ -16,7 +16,11 @@ Public API:
                                below DELETION_FLOOR into cold storage: excluded from recall()/
                                recall_associative() entirely, but not erased — models human
                                "I haven't thought about that in 40 years!" memory rather than
-                               true forgetting. See recall_cold()/revive_from_cold().
+                               true forgetting. See recall_cold()/revive_from_cold(). Nothing
+                               calls this on a schedule — recall()/recall_associative() also
+                               lazily archive a decayed candidate the moment they actually
+                               touch it (see _score_hits()), so prune() is only needed for a
+                               guaranteed full-corpus sweep, not routine correctness.
   recall_cold(text)          — search ONLY archived/cold memories, by raw similarity (not
                                decayed strength) against a much stricter bar than ordinary
                                recall — a cold memory needs a genuinely specific cue to
@@ -509,6 +513,22 @@ def _score_hits(
         similarity = 1.0 - distance
         strength   = _raw_strength(meta["last_accessed"], meta["stability"])
 
+        if strength < DELETION_FLOOR:
+            # Lazy archiving (2026-08-04): prune()'s full-corpus sweep is still the only
+            # way to guarantee every decayed entry gets archived, but nothing calls it
+            # automatically -- so without this, an entry that decays past DELETION_FLOOR
+            # just sits in limbo: already invisible to recall() (strength < RETRIEVAL_FLOOR
+            # catches it below regardless), but not yet archived=True, so recall_cold()
+            # can't find it either, until someone happens to run prune() by hand. Rather
+            # than standing up a scheduler/cron for something that has none today
+            # (PowerMem's lead: check decay lazily at retrieval time instead of a
+            # background sweep), archive it right here, the moment it's actually touched
+            # by a real query. Only covers entries that surface as a nearest-neighbor
+            # candidate for SOME query -- an entry nobody ever queries near stays
+            # unarchived until an explicit prune() sweep, same as before.
+            meta = _archive_entry(col, doc_id, meta)
+            continue
+
         if strength < RETRIEVAL_FLOOR:
             continue
 
@@ -670,6 +690,19 @@ def confirm_activation(doc_id: str) -> bool:
     return True
 
 
+def _archive_entry(col: "chromadb.Collection", doc_id: str, meta: dict) -> dict:
+    """
+    Shared archiving logic — sets archived=True/archived_at and logs it. Used by both
+    prune()'s full-corpus sweep and _score_hits()'s lazy per-candidate check (see "Lazy
+    archiving" there) so the two paths can't drift on what "archived" actually means.
+    Returns the updated metadata dict.
+    """
+    updated = {**meta, "archived": True, "archived_at": time.time()}
+    col.update(ids=[doc_id], metadatas=[updated])
+    _log_activity("archive", doc_id, meta["topic"], meta["title"])
+    return updated
+
+
 def prune() -> int:
     """
     ARCHIVE (not delete) entries whose raw strength has decayed below DELETION_FLOOR —
@@ -680,6 +713,13 @@ def prune() -> int:
     thought about that in 40 years!" phenomenon, rather than a permanent loss.
     Already-archived entries are left alone (idempotent). For true, deliberate permanent
     deletion, see purge() — that's a rare/manual action, not what routine cleanup does.
+
+    This is still the only way to guarantee a full-corpus sweep — nothing calls prune()
+    on a schedule. _score_hits() (see "Lazy archiving" there) opportunistically archives
+    a decayed entry the moment it surfaces as a real query's nearest-neighbor candidate,
+    which covers everything actually being retrieved against without needing a
+    scheduler/cron, but an entry nobody ever queries near only gets archived here.
+
     Returns the count of entries newly archived this call.
     """
     col = _get_collection()
@@ -693,14 +733,8 @@ def prune() -> int:
         if not meta.get("archived") and _raw_strength(meta["last_accessed"], meta["stability"]) < DELETION_FLOOR
     ]
 
-    if to_archive:
-        now = time.time()
-        col.update(
-            ids=[doc_id for doc_id, _ in to_archive],
-            metadatas=[{**meta, "archived": True, "archived_at": now} for _, meta in to_archive],
-        )
-        for doc_id, meta in to_archive:
-            _log_activity("archive", doc_id, meta["topic"], meta["title"])
+    for doc_id, meta in to_archive:
+        _archive_entry(col, doc_id, meta)
 
     return len(to_archive)
 
