@@ -2,6 +2,22 @@
 
 Notable changes to this project, newest first. No version tags/releases — this is a live, continuously-evolving personal system, so entries are dated instead.
 
+## 2026-09-09 — Query helper for activity.log
+
+Closed the parking lot's remaining tractable item: `activity.log` was plain-text, append-only, human-eyeball-only, with no way to ask "everything jotted in the last week" or "every purge with `tombstone=True`" without grepping by hand.
+
+### Added
+
+- `query_activity.py` — new standalone read-only script (mirrors `backlinks.py`'s "diagnostic tool, output only" pattern rather than growing `memory_store.py`'s own API). `iter_entries()`/`query()` filter by `action` (repeatable), `topic`, `since`/`until`, and `doc_id` prefix, all optional and AND'd together. CLI wraps it: `--action jot --topic memory-project --since 2026-09-01`, `--count` for just the total.
+- Parsing handles the log format's one real wrinkle: `action`/`topic` are only left-padded to a *minimum* width (`{x:6s}` doesn't truncate a longer value like `"archive"`), so field boundaries are recovered via `str.split(None, 2)` rather than fixed-width slicing; `doc_id` is pulled from the trailing `"(...)"` via regex since the title in between can itself contain spaces or parens.
+
+### Docs
+
+- `PROJECT_PLAN.md`: parking-lot entry marked DONE with implementation/verification detail, moved out of "open."
+- `CLAUDE.md`: new `## query_activity.py` section; opening paragraph now lists it alongside the classify/backlink scripts.
+- `README.md`: new "Debugging: `query_activity.py`" section under the Public API writeup.
+- `regression_test.py`: new checks in `test_secondary_tools()` — synthetic-log parsing (including a title with embedded parens and a deliberately malformed line), each CLI filter, and a live run against the real 1439-line `activity.log`. Full suite: 88 passed, 0 failed.
+
 ## 2026-08-04 — Fix purge() actually leaking on-disk data (follow-up to the same day's earlier fix)
 
 `purge()`'s collection-rebuild fix from earlier today was incomplete: `delete_collection()` cleanly drops the old segment from Chroma's own `segments` table, but never removes that segment's UUID-named directory from disk — it just orphans it, still fully intact and readable outside the Chroma API. Every `purge()` call since the earlier fix shipped had been leaking one of these; the real `.chromadb/` had accumulated ~137 orphaned directories from one session's testing.

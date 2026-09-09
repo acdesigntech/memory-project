@@ -743,6 +743,43 @@ def test_secondary_tools():
             classify_used = True
     check("classify.py confirmed not imported anywhere live (known prototype)", not classify_used)
 
+    import query_activity as qa
+    from datetime import datetime
+
+    tmp_log = ROOT / f".regression_test_activity_{os.getpid()}.log"
+    try:
+        tmp_log.write_text(
+            "2026-01-01 10:00:00  jot      topic-a         Title with (parens) inside  (fragment/aaa)\n"
+            "2026-01-02 11:00:00  archive  topic-b         Second title  (fragment/bbb)\n"
+            "2026-01-03 12:00:00  purge    topic-a         Third title  (fragment/ccc)\n"
+            "not a valid log line at all\n"
+        )
+        entries = list(qa.iter_entries(tmp_log))
+        check("query_activity parses all well-formed lines, skips malformed", len(entries) == 3, f"got {len(entries)}")
+        check("query_activity recovers doc_id even when title itself has parens", entries[0].doc_id == "fragment/aaa", entries[0].doc_id)
+        check("query_activity recovers title correctly around embedded parens", entries[0].title == "Title with (parens) inside", entries[0].title)
+
+        by_action = qa.query(actions={"jot", "purge"}, log_path=tmp_log)
+        check("query_activity --action filter (multi-value)", {e.action for e in by_action} == {"jot", "purge"}, str([e.action for e in by_action]))
+
+        by_topic = qa.query(topic="topic-a", log_path=tmp_log)
+        check("query_activity --topic filter", len(by_topic) == 2 and all(e.topic == "topic-a" for e in by_topic))
+
+        by_since = qa.query(since=datetime(2026, 1, 2), log_path=tmp_log)
+        check("query_activity --since filter", [e.doc_id for e in by_since] == ["fragment/bbb", "fragment/ccc"])
+
+        by_prefix = qa.query(doc_id_prefix="fragment/a", log_path=tmp_log)
+        check("query_activity --doc-id prefix filter", len(by_prefix) == 1 and by_prefix[0].doc_id == "fragment/aaa")
+    finally:
+        tmp_log.unlink(missing_ok=True)
+
+    proc = subprocess.run([sys.executable, str(ROOT / "query_activity.py"), "--count"], capture_output=True, text=True, timeout=30)
+    check(
+        "query_activity.py CLI runs clean against the real activity.log",
+        proc.returncode == 0 and proc.stdout.strip().isdigit(),
+        proc.stderr[-300:] if proc.returncode else proc.stdout.strip(),
+    )
+
 
 # ---------------------------------------------------------------- cleanup helpers
 
