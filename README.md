@@ -82,6 +82,17 @@ Every time it *is* recalled, though, `stability` gets multiplied by 1.5× and th
 - **`ingest(path)`** — the full curated tier: file-backed, classified, backlinked. Reserve for something worth filing and reading later as a standalone document.
 - **`prune()`** — archives (not deletes) anything below the deletion floor. **`recall_cold(query, n_results=3)`** searches only archived entries, with a much stricter similarity bar (0.6 vs. the ordinary 0.35) — resurfacing something long-dormant should take a genuinely specific cue, not a loose association. **`revive_from_cold(doc_id)`** un-archives a confirmed hit. **`purge(doc_id)`** is true, permanent deletion — a rare, deliberate escape hatch, not routine cleanup.
 
+## Debugging: `query_activity.py`
+
+Every call above also appends one line to `activity.log`, a plain-text append-only record (timestamp, action, topic, title, doc_id). Since capture is largely autonomous — `jot()` fires proactively mid-conversation, `auto_capture.py` fires with no human review at all — `query_activity.py` is how you audit what it's actually been doing without grepping a growing text file by hand:
+
+```bash
+.venv/bin/python query_activity.py --action jot --topic memory-project --since 2026-09-01
+.venv/bin/python query_activity.py --action purge --count
+```
+
+Filters (`--action` repeatable, `--topic`, `--since`/`--until`, `--doc-id`) are AND'd together; omit any of them to not restrict on that axis. Read-only, touches nothing.
+
 ## Setup
 
 ```bash
